@@ -364,18 +364,28 @@ public sealed class CodeIndexService
 
         IReadOnlyList<ScoredIndex> fused = HybridRanker.Fuse(vectorHits, symbolHits, limit);
 
-        List<SearchHit> hits = new(fused.Count);
-        foreach (ScoredIndex scored in fused)
+        // Excerpt reads are independent ISourceProvider calls (one file read each), so running
+        // them concurrently instead of one-at-a-time keeps this linear in wall-clock file I/O
+        // only for the slowest read, not the sum of all of them — worth doing now that `limit`
+        // (and therefore fused.Count) is no longer capped at a small fixed branch depth.
+        Task<string>[] excerptTasks = new Task<string>[fused.Count];
+        for (int i = 0; i < fused.Count; i++)
         {
-            CodeChunk chunk = snapshot.Chunks[scored.Index];
-            string excerpt = await ReadExcerptAsync(chunk, cancellationToken).ConfigureAwait(false);
+            excerptTasks[i] = ReadExcerptAsync(snapshot.Chunks[fused[i].Index], cancellationToken);
+        }
 
+        string[] excerpts = await Task.WhenAll(excerptTasks).ConfigureAwait(false);
+
+        List<SearchHit> hits = new(fused.Count);
+        for (int i = 0; i < fused.Count; i++)
+        {
+            ScoredIndex scored = fused[i];
             hits.Add(new SearchHit
             {
                 ChunkId = scored.Index,
-                Chunk = chunk,
+                Chunk = snapshot.Chunks[scored.Index],
                 Score = scored.Score,
-                Excerpt = excerpt,
+                Excerpt = excerpts[i],
             });
         }
 
