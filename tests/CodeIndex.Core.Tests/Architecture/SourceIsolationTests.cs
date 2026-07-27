@@ -69,7 +69,10 @@ public sealed class SourceIsolationTests
     private static readonly HashSet<string> ForbiddenTypeNames = new(StringComparer.Ordinal)
     {
         "File", "Directory", "FileInfo", "DirectoryInfo",
+        "FileStream", "StreamReader", "StreamWriter", "FileSystemWatcher",
     };
+
+    private const string ForbiddenNamespace = "System.IO";
 
     private const string ExemptNamespace = "CodeIndex.Core.Sources";
     private const string ExemptFullTypeName = "CodeIndex.Core.Storage.IndexStore";
@@ -262,13 +265,19 @@ public sealed class SourceIsolationTests
 
         TypeReference typeReference = reader.GetTypeReference((TypeReferenceHandle)memberReference.Parent);
         string typeName = reader.GetString(typeReference.Name);
-
-        if (!ForbiddenTypeNames.Contains(typeName))
-            return null;
-
         string typeNamespace = reader.GetString(typeReference.Namespace);
+
+        // Namespace-qualify the match, not just the bare type name: an unrelated type that
+        // happens to be called "File" or "Directory" outside System.IO (e.g. a domain model)
+        // must not trip this check.
+        if (!string.Equals(typeNamespace, ForbiddenNamespace, StringComparison.Ordinal) ||
+            !ForbiddenTypeNames.Contains(typeName))
+        {
+            return null;
+        }
+
         string memberName = reader.GetString(memberReference.Name);
-        return typeNamespace.Length == 0 ? $"{typeName}.{memberName}" : $"{typeNamespace}.{typeName}.{memberName}";
+        return $"{typeNamespace}.{typeName}.{memberName}";
     }
 
     private static OpCode ReadOpCode(byte[] il, ref int position)

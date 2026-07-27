@@ -335,19 +335,15 @@ public sealed class VectorSearcherTests
 
         for (int i = 0; i < count; i++)
         {
-            double sumOfSquares = 0.0;
-            int offset = i * dimensions;
-
+            // Drawing each random component is inherently scalar (Random has no vectorised
+            // API), but per this project's own rule against per-element loops over vector
+            // components, the normalisation below must not add a second one.
+            Span<float> vector = vectors.AsSpan(i * dimensions, dimensions);
             for (int d = 0; d < dimensions; d++)
-            {
-                float component = (float)(random.NextDouble() * 2.0 - 1.0);
-                vectors[offset + d] = component;
-                sumOfSquares += (double)component * component;
-            }
+                vector[d] = (float)(random.NextDouble() * 2.0 - 1.0);
 
-            float magnitude = (float)Math.Sqrt(sumOfSquares);
-            for (int d = 0; d < dimensions; d++)
-                vectors[offset + d] /= magnitude;
+            float magnitude = TensorPrimitives.Norm<float>(vector);
+            TensorPrimitives.Divide(vector, magnitude, vector);
         }
 
         return vectors;

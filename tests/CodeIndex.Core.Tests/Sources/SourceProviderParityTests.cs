@@ -16,13 +16,22 @@ public sealed class SourceProviderParityTests : IDisposable
 
     public SourceProviderParityTests() => Directory.CreateDirectory(_root);
 
-    public void Dispose() => Directory.Delete(_root, recursive: true);
+    public void Dispose()
+    {
+        // Best-effort cleanup: if setup failed before _root was created (or a test already
+        // removed it), Directory.Delete throwing here would replace the real test failure with
+        // an unrelated DirectoryNotFoundException from teardown.
+        if (Directory.Exists(_root))
+            Directory.Delete(_root, recursive: true);
+    }
 
     public static IEnumerable<object[]> Contents()
     {
         yield return ["line1\nline2\nline3\nline4\n"];
         yield return ["line1\nline2\nline3\nline4"];
         yield return ["line1\r\nline2\r\nline3\r\nline4\r\n"];
+        yield return ["line1\rline2\rline3\rline4\r"];
+        yield return ["line1\r\nline2\nline3\r\nline4\n"];
         yield return [string.Empty];
     }
 

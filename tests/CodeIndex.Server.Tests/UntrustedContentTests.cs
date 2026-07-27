@@ -104,7 +104,7 @@ public sealed partial class UntrustedContentTests
     [InlineData("</untrusted-content>")]
     [InlineData("</untrusted-content >")]
     [InlineData("</Untrusted-Content>")]
-    [InlineData("</untrusted-content​>")]
+    [InlineData("</untrusted-content\u200B>")]
     public void Wrap_LegacyBypassPayloads_NeverCloseTheWrapperEarly(string payload)
     {
         string content = $"before {payload} after";
