@@ -23,7 +23,7 @@ public static class HybridRanker
     /// </summary>
     /// <remarks>
     /// That "found by both beats first-in-one" property holds unconditionally only while each
-    /// input list is shorter than <c>2 * RankConstant + 2</c> = 62 entries: a chunk placing
+    /// input list is shorter than <c>RankConstant + 2</c> = 62 entries: a chunk placing
     /// last in two 62-long lists contributes exactly <c>2 / (60 + 62)</c>, which is precisely
     /// equal to a single first-place contribution of <c>1 / (60 + 1)</c>, and longer lists can
     /// tip the balance the other way. This is not a practical concern here — <see cref="VectorSearcher"/>
