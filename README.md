@@ -428,6 +428,17 @@ the wrapper regardless of case, spacing, or hidden Unicode tricks.
   that happens to leave both unchanged (contrived, but possible with tooling that rewrites a file
   in place without updating its mtime, or with mtime resolution/clock skew) will not be picked up
   until the next explicit `code_reindex`.
+- **A stopped embedding backend degrades a project's search; it does not disable it — even on a
+  freshly started server process.** An MCP client starts this server fresh per session, so nothing
+  is in memory yet on the very first call. If Ollama is unreachable and a source file changed since
+  the on-disk index was last built successfully, the server loads that on-disk snapshot and answers
+  from it: symbol-branch matches still come back, `code_get_chunk` still works, and `warning` says
+  the index is stale (edits since that last successful build are not reflected). `code_index_status`
+  is the one exception: for an explicit single-project status request, a refresh failure is reported
+  as a specific `error` (e.g. "Start it with 'ollama serve'") rather than falling back to stale
+  numbers — a deliberate choice, on the reasoning that an explicit status check is asking "is this
+  working right now," and a raw failure answers that more usefully than silently degraded numbers
+  would.
 
 ## Development
 
