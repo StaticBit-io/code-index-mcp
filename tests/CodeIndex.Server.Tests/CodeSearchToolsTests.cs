@@ -484,6 +484,68 @@ public sealed partial class CodeSearchToolsTests : IDisposable
         Assert.Contains(DefaultProjectId, message, StringComparison.Ordinal);
     }
 
+    // --- Readable errors instead of the MCP SDK's generic wrapper (single-project paths) -------
+
+    [Fact]
+    public async Task CodeSearch_WithProject_EmbeddingBackendNeverWorked_ReturnsReadableErrorRatherThanThrowing()
+    {
+        WriteFile("src/A.cs", MakeSimpleFile("Acme.A", "Widget", "DoA"));
+        // Throws from the very first call: nothing has ever been indexed, on disk or in memory,
+        // so CodeIndexService has genuinely nothing to fall back to and must let the failure
+        // through — this test is about what happens to it once it reaches the tool layer.
+        StubEmbeddingClient embedder = new() { ShouldThrow = true };
+        CodeSearchTools tools = CreateTools(embedder);
+
+        string json = await tools.SearchAsync(
+            "DoA", limit: 10, kind: null, path_filter: null, project: DefaultProjectId, TestContext.Current.CancellationToken);
+
+        using JsonDocument document = JsonDocument.Parse(json);
+        Assert.True(document.RootElement.TryGetProperty("error", out JsonElement errorElement));
+        Assert.Contains("unavailable", errorElement.GetString(), StringComparison.OrdinalIgnoreCase);
+    }
+
+    [Fact]
+    public async Task CodeGetChunk_WithProject_EmbeddingBackendNeverWorked_ReturnsReadableErrorRatherThanThrowing()
+    {
+        WriteFile("src/A.cs", MakeSimpleFile("Acme.A", "Widget", "DoA"));
+        StubEmbeddingClient embedder = new() { ShouldThrow = true };
+        CodeSearchTools tools = CreateTools(embedder);
+
+        string json = await tools.GetChunkAsync($"{DefaultProjectId}:0", TestContext.Current.CancellationToken);
+
+        using JsonDocument document = JsonDocument.Parse(json);
+        Assert.True(document.RootElement.TryGetProperty("error", out JsonElement errorElement));
+        Assert.Contains("unavailable", errorElement.GetString(), StringComparison.OrdinalIgnoreCase);
+    }
+
+    [Fact]
+    public async Task CodeIndexStatus_WithProject_EmbeddingBackendNeverWorked_ReturnsReadableErrorRatherThanThrowing()
+    {
+        WriteFile("src/A.cs", MakeSimpleFile("Acme.A", "Widget", "DoA"));
+        StubEmbeddingClient embedder = new() { ShouldThrow = true };
+        CodeSearchTools tools = CreateTools(embedder);
+
+        string json = await tools.StatusAsync(DefaultProjectId, TestContext.Current.CancellationToken);
+
+        using JsonDocument document = JsonDocument.Parse(json);
+        Assert.True(document.RootElement.TryGetProperty("error", out JsonElement errorElement));
+        Assert.Contains("unavailable", errorElement.GetString(), StringComparison.OrdinalIgnoreCase);
+    }
+
+    [Fact]
+    public async Task CodeReindex_WithProject_EmbeddingBackendNeverWorked_ReturnsReadableErrorRatherThanThrowing()
+    {
+        WriteFile("src/A.cs", MakeSimpleFile("Acme.A", "Widget", "DoA"));
+        StubEmbeddingClient embedder = new() { ShouldThrow = true };
+        CodeSearchTools tools = CreateTools(embedder);
+
+        string json = await tools.ReindexAsync(DefaultProjectId, TestContext.Current.CancellationToken);
+
+        using JsonDocument document = JsonDocument.Parse(json);
+        Assert.True(document.RootElement.TryGetProperty("error", out JsonElement errorElement));
+        Assert.Contains("unavailable", errorElement.GetString(), StringComparison.OrdinalIgnoreCase);
+    }
+
     // --- Multi-project tests -------------------------------------------------------------
 
     [Fact]
