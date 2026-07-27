@@ -437,7 +437,12 @@ public sealed class CodeSearchTools
             return null;
         }
 
-        return Enum.TryParse(kind, ignoreCase: true, out ChunkKind parsed) ? parsed : null;
+        // Enum.TryParse alone accepts unnamed numeric strings (e.g. "999") as a "valid" ChunkKind,
+        // which would then filter against a value nothing can ever equal and silently return zero
+        // hits instead of the "no filter" behaviour a caller reasonably expects from garbage input.
+        return Enum.TryParse(kind, ignoreCase: true, out ChunkKind parsed) && Enum.IsDefined(parsed)
+            ? parsed
+            : null;
     }
 
     /// <summary>One project's entry in a multi-project <c>code_index_status</c> response (and the

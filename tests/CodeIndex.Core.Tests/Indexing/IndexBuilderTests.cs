@@ -456,6 +456,20 @@ public sealed class IndexBuilderTests : IDisposable
             () => builder.BuildAsync(TestContext.Current.CancellationToken));
     }
 
+    [Fact]
+    public async Task BuildAsync_ThrowsEmbeddingUnavailableRatherThanNullReferenceWhenTheEmbeddingClientReturnsANullVector()
+    {
+        InMemorySourceProvider source = new(new Dictionary<string, string>
+        {
+            ["src/A.cs"] = MakeFile("Acme.A", "Widget", "DoA"),
+        });
+        MisbehavingEmbeddingClient embedder = new() { Mode = MisbehaviorMode.NullVector };
+        IndexBuilder builder = CreateBuilder(source, embedder, out _);
+
+        await Assert.ThrowsAsync<EmbeddingUnavailableException>(
+            () => builder.BuildAsync(TestContext.Current.CancellationToken));
+    }
+
     /// <summary>Wraps an <see cref="ISourceProvider"/> and counts <see cref="ReadTextAsync"/>
     /// calls, so a test can assert that a code path never reads file content (as opposed to only
     /// statting it).</summary>

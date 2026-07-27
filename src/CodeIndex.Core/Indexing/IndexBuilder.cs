@@ -514,7 +514,13 @@ public sealed class IndexBuilder
 
             for (int i = 0; i < count; i++)
             {
-                float[] vector = embedded[i];
+                float[]? vector = embedded[i];
+                if (vector is null)
+                {
+                    throw new EmbeddingUnavailableException(
+                        $"Embedding model '{_embeddingClient.Model}' returned a null vector for chunk index {offset + i}.");
+                }
+
                 if (vector.Length != dimensions)
                 {
                     throw new EmbeddingUnavailableException(

@@ -35,8 +35,14 @@ public readonly record struct ProjectChunkId(string ProjectId, int ChunkId)
     /// even in the (already-rejected-at-config-time, see <see cref="ProjectOptions.ValidateId"/>)
     /// hypothetical case of a project id that itself contains one.
     /// </remarks>
-    public static bool TryParse(string value, out ProjectChunkId result)
+    public static bool TryParse(string? value, out ProjectChunkId result)
     {
+        if (value is null)
+        {
+            result = default;
+            return false;
+        }
+
         int separatorIndex = value.LastIndexOf(':');
         if (separatorIndex <= 0 || separatorIndex == value.Length - 1)
         {

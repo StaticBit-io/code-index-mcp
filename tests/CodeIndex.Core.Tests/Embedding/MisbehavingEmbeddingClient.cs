@@ -14,6 +14,12 @@ public enum MisbehaviorMode
     /// <summary>Returns a vector one component short of <see cref="MisbehavingEmbeddingClient.Dimensions"/>
     /// for the first input of every batch.</summary>
     ShortVector,
+
+    /// <summary>Returns <see langword="null"/> in place of the first vector of every batch —
+    /// a contract violation compiler nullability alone does not stop a misbehaving
+    /// implementation (e.g. one deserializing an HTTP response with a missing field) from
+    /// committing at runtime.</summary>
+    NullVector,
 }
 
 /// <summary>
@@ -44,6 +50,7 @@ public sealed class MisbehavingEmbeddingClient : IEmbeddingClient
         {
             MisbehaviorMode.DropOneVector => result.Take(result.Count - 1).ToList(),
             MisbehaviorMode.ShortVector => Shorten(result),
+            MisbehaviorMode.NullVector => Nullify(result),
             _ => result,
         };
     }
@@ -52,6 +59,17 @@ public sealed class MisbehavingEmbeddingClient : IEmbeddingClient
     {
         List<float[]> copy = new(result);
         copy[0] = copy[0][..^1];
+        return copy;
+    }
+
+    /// <summary>Deliberately smuggles a <see langword="null"/> past this method's own
+    /// non-nullable <c>float[]</c> return type — exactly the mismatch between a compile-time
+    /// annotation and an actual misbehaving implementation that <c>IndexBuilder</c> must not
+    /// trust blindly.</summary>
+    private static List<float[]> Nullify(IReadOnlyList<float[]> result)
+    {
+        List<float[]> copy = new(result);
+        copy[0] = null!;
         return copy;
     }
 

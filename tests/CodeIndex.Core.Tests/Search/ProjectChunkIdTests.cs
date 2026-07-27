@@ -35,6 +35,16 @@ public sealed class ProjectChunkIdTests
     }
 
     [Fact]
+    public void TryParse_NullValue_ReturnsFalseRatherThanThrowing()
+    {
+        // value arrives from the MCP tool boundary (external input) where a client is not
+        // bound by this method's C# nullability annotation, so a null must fail cleanly
+        // rather than raise a NullReferenceException — see the "never throws" doc contract.
+        Assert.False(ProjectChunkId.TryParse(null, out ProjectChunkId result));
+        Assert.Equal(default, result);
+    }
+
+    [Fact]
     public void TryParse_UsesTheLastColonAsTheSeparator()
     {
         // A project id can never itself contain ':' (see ProjectOptions.ValidateId), so a
