@@ -1,0 +1,32 @@
+## .NET
+bin/
+obj/
+[Dd]ebug/
+[Rr]elease/
+*.user
+*.suo
+*.userprefs
+project.lock.json
+artifacts/
+
+## IDE
+.vs/
+.vscode/
+.idea/
+*.swp
+
+## Test / coverage
+TestResults/
+coverage*.xml
+coverage*.json
+*.coverage
+
+## Local index cache (never committed)
+/.codeindex/
+
+## Local, machine-specific config override (never committed)
+appsettings.Local.json
+
+## OS
+Thumbs.db
+.DS_Store
