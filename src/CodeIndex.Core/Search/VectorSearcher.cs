@@ -43,8 +43,23 @@ public sealed class VectorSearcher
 
     /// <summary>
     /// Scores every row against <paramref name="query"/> and returns the <paramref name="topK"/>
-    /// highest-scoring rows, descending.
+    /// highest-scoring rows, descending, excluding any row whose score falls below <paramref
+    /// name="minScore"/>.
     /// </summary>
+    /// <param name="query">The query vector, scored against every row via cosine similarity (a
+    /// plain dot product — see the class remarks on why vectors are assumed unit-normalised).</param>
+    /// <param name="topK">How many of the highest-scoring rows to return, at most.</param>
+    /// <param name="minScore">
+    /// Relevance floor: a row is never selected — not even to fill out an otherwise short result
+    /// set — unless its score is at least this value. Defaults to <see
+    /// cref="float.NegativeInfinity"/>, which admits every row (the pre-existing behaviour, still
+    /// used by every caller that has no meaningful floor to apply, e.g. every test in this file).
+    /// Filtering here, before selection, rather than after, means a floor that rejects most of the
+    /// corpus also makes the heap smaller in practice, not just the final output — see <see
+    /// cref="CodeIndex.Core.Search.CodeIndexService"/> for why this exists: without it, an
+    /// unrelated project's (or a nonsense query's) merely-best-available match still gets "rank 1"
+    /// and scores identically under Reciprocal Rank Fusion to a genuinely strong match elsewhere.
+    /// </param>
     /// <remarks>
     /// Selection of the top K uses a size-bounded min-heap (<see cref="PriorityQueue{TElement,TPriority}"/>)
     /// rather than sorting all <see cref="Count"/> scores: that is O(N log K) instead of
@@ -65,7 +80,7 @@ public sealed class VectorSearcher
     /// score, and on a tied score, as the *higher* index, so eviction always drops the
     /// higher-index element of a tie and the kept set is deterministic regardless of topK.
     /// </remarks>
-    public IReadOnlyList<ScoredIndex> Search(ReadOnlySpan<float> query, int topK)
+    public IReadOnlyList<ScoredIndex> Search(ReadOnlySpan<float> query, int topK, float minScore = float.NegativeInfinity)
     {
         if (query.Length != _dimensions)
         {
@@ -98,6 +113,16 @@ public sealed class VectorSearcher
             // TensorPrimitives.Dot runs as a single SIMD block operation over the whole row,
             // never element by element.
             float score = TensorPrimitives.Dot(_vectors.AsSpan(i * _dimensions, _dimensions), query);
+
+            if (score < minScore)
+            {
+                // Below the relevance floor: excluded outright, never merely low priority. A row
+                // this weak must not fill out the result set just because fewer than `take` rows
+                // cleared the floor — an empty (or short) result honestly says "nothing here was
+                // relevant enough," which is the whole point of the floor (see the parameter doc).
+                continue;
+            }
+
             (float Score, int Index) priority = (score, i);
 
             if (heap.Count < take)

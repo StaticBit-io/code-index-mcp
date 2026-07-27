@@ -79,6 +79,47 @@ public sealed class VectorSearcherTests
     }
 
     [Fact]
+    public void Search_MinScore_ExcludesRowsBelowTheFloorEvenWhenFewerThanTopKSurvive()
+    {
+        // Index 0 scores 1.0 (perfect match), index 1 scores 0.0 (orthogonal) against [1, 0].
+        VectorSearcher searcher = new([1f, 0f, 0f, 1f], dimensions: 2);
+
+        IReadOnlyList<ScoredIndex> hits = searcher.Search([1f, 0f], topK: 5, minScore: 0.5f);
+
+        // topK asked for 5, but only one row cleared the floor: the result is honestly short,
+        // not padded out with the orthogonal row just because fewer than 5 rows qualified.
+        ScoredIndex hit = Assert.Single(hits);
+        Assert.Equal(0, hit.Index);
+        Assert.Equal(1.0f, hit.Score, precision: 5);
+    }
+
+    [Fact]
+    public void Search_MinScore_ReturnsEmptyWhenNoRowClearsTheFloor()
+    {
+        VectorSearcher searcher = new([0f, 1f], dimensions: 2);
+
+        Assert.Empty(searcher.Search([1f, 0f], topK: 5, minScore: 0.5f));
+    }
+
+    [Fact]
+    public void Search_MinScore_DefaultsToNegativeInfinity_AdmittingEveryRow()
+    {
+        VectorSearcher searcher = new([1f, 0f, 0f, 1f], dimensions: 2);
+
+        // No minScore passed: behaves exactly as before the relevance floor existed.
+        Assert.Equal(2, searcher.Search([1f, 0f], topK: 5).Count);
+    }
+
+    [Fact]
+    public void Search_MinScore_IsInclusiveAtTheBoundary()
+    {
+        VectorSearcher searcher = new([1f, 0f], dimensions: 2);
+
+        // The row's score is exactly 1.0; a floor of exactly 1.0 must still admit it (">=", not ">").
+        Assert.Single(searcher.Search([1f, 0f], topK: 5, minScore: 1.0f));
+    }
+
+    [Fact]
     public void Search_ThrowsWhenQueryContainsNaN()
     {
         VectorSearcher searcher = new([1f, 0f, 0f, 1f], dimensions: 2);

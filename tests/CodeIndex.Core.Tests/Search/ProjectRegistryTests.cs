@@ -1,4 +1,5 @@
 using CodeIndex.Core.Chunking;
+using CodeIndex.Core.Embedding;
 using CodeIndex.Core.Search;
 using CodeIndex.Core.Storage;
 using CodeIndex.Core.Tests.Embedding;
@@ -196,6 +197,76 @@ public sealed class ProjectRegistryTests : IDisposable
         Assert.Contains(result.Hits, h => h.ProjectId == "good");
         Assert.NotNull(result.Warning);
         Assert.Contains("broken", result.Warning, StringComparison.Ordinal);
+    }
+
+    /// <summary>
+    /// Reproduces the exact bug measured in review: an unrelated project's single, weak vector
+    /// match still receives "its own rank 1" and, because Reciprocal Rank Fusion scores purely by
+    /// rank, fuses to a score indistinguishable from a genuinely strong match in another project —
+    /// so the unrelated project's noise takes slots that belong to the real hit. Both projects
+    /// share one <see cref="MarkerBasedEmbeddingClient"/> instance, exactly like production shares
+    /// one Ollama endpoint across every configured project (see <see cref="ProjectRegistry"/>'s own
+    /// constructor). Without a relevance floor (<see cref="EmbeddingOptions.MinCosineSimilarity"/>
+    /// left at its "no floor" test default), the unrelated project's hit is merged in right beside
+    /// the real one.
+    /// </summary>
+    [Fact]
+    public async Task SearchAllAsync_WithNoRelevanceFloor_AnUnrelatedProjectsWeakMatchIsMergedInAlongsideTheRealOne()
+    {
+        string realRoot = CreateProjectRoot("floor-real");
+        string unrelatedRoot = CreateProjectRoot("floor-unrelated");
+        WriteFile(realRoot, "src/Alpha.cs", MakeSimpleFile("Acme.Alpha", "Widget", MarkerBasedEmbeddingClient.RealHitMarker));
+        WriteFile(unrelatedRoot, "src/Beta.cs", MakeSimpleFile("Acme.Beta", "Gadget", MarkerBasedEmbeddingClient.UnrelatedHitMarker));
+
+        MarkerBasedEmbeddingClient embedder = new();
+        CodeIndexOptions options = new()
+        {
+            Projects =
+            [
+                new ProjectOptions { Id = "real", Root = realRoot, CacheDirectory = CreateCacheDirectoryPath("floor-real") },
+                new ProjectOptions { Id = "unrelated", Root = unrelatedRoot, CacheDirectory = CreateCacheDirectoryPath("floor-unrelated") },
+            ],
+        };
+        ProjectRegistry registry = new(options, CreatePipeline(), embedder);
+
+        MultiProjectSearchResult result = await registry.SearchAllAsync(
+            "irrelevant text — MarkerBasedEmbeddingClient ignores it", limit: 10, kind: null, pathFilter: null,
+            TestContext.Current.CancellationToken);
+
+        Assert.Contains(result.Hits, h => h.ProjectId == "real");
+        Assert.Contains(result.Hits, h => h.ProjectId == "unrelated");
+    }
+
+    /// <summary>Same fixture and shared embedder as the test above, but with a relevance floor
+    /// configured between the two markers' cosine similarities (1.0 for the real hit, 0.0 for the
+    /// unrelated one) — the fix: the unrelated project contributes zero vector hits (not one
+    /// disguised as "rank 1"), so it never reaches the merge at all.</summary>
+    [Fact]
+    public async Task SearchAllAsync_WithARelevanceFloor_AnUnrelatedProjectsWeakMatchNeverReachesTheMerge()
+    {
+        string realRoot = CreateProjectRoot("floor2-real");
+        string unrelatedRoot = CreateProjectRoot("floor2-unrelated");
+        WriteFile(realRoot, "src/Alpha.cs", MakeSimpleFile("Acme.Alpha", "Widget", MarkerBasedEmbeddingClient.RealHitMarker));
+        WriteFile(unrelatedRoot, "src/Beta.cs", MakeSimpleFile("Acme.Beta", "Gadget", MarkerBasedEmbeddingClient.UnrelatedHitMarker));
+
+        MarkerBasedEmbeddingClient embedder = new();
+        CodeIndexOptions options = new()
+        {
+            Projects =
+            [
+                new ProjectOptions { Id = "real", Root = realRoot, CacheDirectory = CreateCacheDirectoryPath("floor2-real") },
+                new ProjectOptions { Id = "unrelated", Root = unrelatedRoot, CacheDirectory = CreateCacheDirectoryPath("floor2-unrelated") },
+            ],
+        };
+        EmbeddingOptions embeddingOptions = new() { MinCosineSimilarity = 0.5 };
+        ProjectRegistry registry = new(options, CreatePipeline(), embedder, embeddingOptions);
+
+        MultiProjectSearchResult result = await registry.SearchAllAsync(
+            "irrelevant text — MarkerBasedEmbeddingClient ignores it", limit: 10, kind: null, pathFilter: null,
+            TestContext.Current.CancellationToken);
+
+        Assert.Contains(result.Hits, h => h.ProjectId == "real");
+        Assert.DoesNotContain(result.Hits, h => h.ProjectId == "unrelated");
     }
 
     [Fact]

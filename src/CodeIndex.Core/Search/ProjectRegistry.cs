@@ -43,10 +43,32 @@ public sealed class ProjectRegistry
     private readonly Dictionary<string, ProjectEntry> _entries;
     private readonly List<string> _projectIds;
 
+    /// <param name="options">The projects to configure, plus settings shared across all of them.</param>
+    /// <param name="chunkerPipeline">Shared chunker handed to every project's <see cref="IndexBuilder"/>.</param>
+    /// <param name="embeddingClient">Shared embedding backend every project's index talks to.</param>
+    /// <param name="embeddingOptions">
+    /// Supplies <see cref="EmbeddingOptions.MinCosineSimilarity"/> for every project's <see
+    /// cref="CodeIndexService"/> (see <see cref="SearchAllAsync"/>'s remarks for why a relevance
+    /// floor matters specifically for the cross-project merge this class does). Optional; when
+    /// omitted, every project's relevance floor is disabled entirely (<see
+    /// cref="double.NegativeInfinity"/>) rather than defaulting to <see
+    /// cref="EmbeddingOptions.DefaultMinCosineSimilarity"/> — that default was measured against a
+    /// real embedding model and is meaningless (see <see cref="CodeIndexService"/>'s own
+    /// constructor remarks) applied to the non-semantic stub embedders essentially every test in
+    /// this codebase uses, and this parameter exists precisely so those existing, single-argument
+    /// callers keep compiling and keep their pre-floor behaviour unchanged. Production wiring
+    /// (<c>Program.cs</c>) always passes the real, configuration-bound <see cref="EmbeddingOptions"/>
+    /// explicitly.
+    /// </param>
     public ProjectRegistry(
-        CodeIndexOptions options, ChunkerPipeline chunkerPipeline, IEmbeddingClient embeddingClient)
+        CodeIndexOptions options,
+        ChunkerPipeline chunkerPipeline,
+        IEmbeddingClient embeddingClient,
+        EmbeddingOptions? embeddingOptions = null)
     {
         options.Validate();
+
+        double minCosineSimilarity = embeddingOptions?.MinCosineSimilarity ?? double.NegativeInfinity;
 
         _entries = new Dictionary<string, ProjectEntry>(StringComparer.Ordinal);
         _projectIds = new List<string>(options.Projects.Count);
@@ -67,7 +89,7 @@ public sealed class ProjectRegistry
             ISourceProvider source = new FileSystemSourceProvider(project.Root);
             IndexStore store = new IndexStore(project.ResolveCacheDirectory());
             IndexBuilder builder = new(source, chunkerPipeline, embeddingClient, store, optionsWrapper);
-            CodeIndexService service = new(builder, source, embeddingClient);
+            CodeIndexService service = new(builder, source, embeddingClient, minCosineSimilarity);
 
             _entries[project.Id] = new ProjectEntry(service, null, project);
         }
@@ -130,6 +152,25 @@ public sealed class ProjectRegistry
     /// the two corpora are. That is precisely what makes pooling-and-re-sorting by fused score a
     /// principled merge here, unlike merging two independent corpora's raw cosine similarities
     /// (which are not directly comparable at all — nothing normalises them against each other).
+    /// </para>
+    /// <para>
+    /// <b>Correction: the paragraph above is only true once the vector branch has a relevance
+    /// floor.</b> "A hit's contribution depends only on its rank position, never on the raw
+    /// similarity value" was originally read as a reason RRF makes the cross-project merge safe.
+    /// It is actually the reason an earlier version of this merge was broken: rank-only scoring
+    /// means a project with nothing genuinely relevant still hands its single best (but weak)
+    /// vector match "rank 1" — which then scores identically under RRF to a rank-1 hit from a
+    /// project where that match is a real answer. Measured case: alongside a real 8,751-chunk
+    /// index, an unrelated seven-chunk project took 4 of 8 merged slots for a genuine query,
+    /// because its best (and only) candidate's cosine similarity of 0.071 was fused into the exact
+    /// same RRF score as the real index's 0.9525 match — RRF never saw either number, only "rank
+    /// 1 in a branch of size N." <see cref="CodeIndex.Core.Embedding.EmbeddingOptions.MinCosineSimilarity"/>
+    /// closes that gap: <see cref="Search.VectorSearcher"/> now excludes a candidate outright
+    /// before it can ever receive a rank at all when its cosine similarity falls below the
+    /// configured floor, so a project with nothing relevant contributes zero vector hits — not one
+    /// disguised as "rank 1" — and RRF's rank-only comparability claim above is restored to being
+    /// actually true of what reaches it, rather than true only of numbers that already lied about
+    /// how good the underlying match was.
     /// </para>
     /// <para>
     /// The alternative, round-robin interleaving (one hit from each project in turn), was rejected

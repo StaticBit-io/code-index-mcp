@@ -66,10 +66,16 @@ Only `.cs` files are indexed. There is no support for other languages or file ty
        "Model": "qwen3-embedding:4b",
        "Dimensions": 1024,
        "KeepAlive": "30m",
-       "QueryInstruction": "Given a developer's question about a codebase, retrieve the C# code that implements it."
+       "QueryInstruction": "Given a developer's question about a codebase, retrieve the C# code that implements it.",
+       "MinCosineSimilarity": 0.55
      }
    }
    ```
+   `MinCosineSimilarity` is the vector branch's relevance floor — a chunk whose cosine similarity
+   to the query falls below it is excluded outright, never returned just to pad out a short result
+   set. `0.55` is this project's measured default for `qwen3-embedding:4b` at 1024 dimensions (see
+   [Searching across projects](#searching-across-projects) for the measurement); re-measure before
+   trusting it with a different model, dimensionality, or `QueryInstruction`.
    `CodeIndex:Projects` is a list — a single project is just a one-element list, as above. To
    index several repositories from one server, add more entries:
    ```json
@@ -198,6 +204,23 @@ unrelated corpora. Round-robin interleaving was rejected because it ignores matc
 project with one excellent hit and nine mediocre ones would have its best result alternate with,
 and sometimes lose a slot to, another project's mediocre hits purely because of interleaving
 order.
+
+**Correction: the paragraph above is only true once the vector branch has a relevance floor.**
+"A hit's score depends only on its rank position, never on the raw similarity value" was originally
+read as the reason this merge is safe. It is actually the reason an earlier version of it was
+broken: rank-only scoring means a project with nothing genuinely relevant still hands its single
+best (but weak) vector match "rank 1" — which then fuses to the exact same score as a rank-1 hit
+from a project where that match is real. Measured case: alongside a real 8,751-chunk index, an
+unrelated seven-chunk project about cooking took **4 of 8** merged slots for the query "where do we
+validate trustline deletion", because its best (and only) candidate's cosine similarity of `0.071`
+fused to the identical RRF score as the real index's `0.9525` match — RRF never saw either number,
+only "rank 1 in a branch of size N." `Embedding:MinCosineSimilarity` (see
+[Setup](#setup) and `EmbeddingOptions.MinCosineSimilarity`'s own remarks for how its `0.55` default
+was measured) closes that gap: a candidate is excluded before it can receive a rank at all once its
+cosine similarity falls below the configured floor, so a project with nothing relevant contributes
+zero vector hits — not one disguised as "rank 1" — and the rank-only comparability claim above is
+restored to being true of what actually reaches the merge, rather than true only of numbers that
+already lied about how good the match was.
 
 Every configured project is refreshed and searched **concurrently**, not one after another. Each
 project's index is fully independent — its own on-disk cache, its own file-change tracking, its

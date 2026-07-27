@@ -4,6 +4,14 @@ public sealed class EmbeddingOptions
 {
     public const string SectionName = "Embedding";
 
+    /// <summary>
+    /// Default for <see cref="MinCosineSimilarity"/> — see that property's remarks for how this
+    /// value was measured. A separate <c>const</c> (rather than only living as the property's
+    /// initialiser) so <see cref="CodeIndex.Core.Search.CodeIndexService"/>'s own constructor
+    /// default can refer to the exact same value instead of duplicating the literal.
+    /// </summary>
+    public const double DefaultMinCosineSimilarity = 0.55;
+
     public string Endpoint { get; set; } = "http://localhost:11434";
     public string Model { get; set; } = "qwen3-embedding:4b";
 
@@ -36,4 +44,55 @@ public sealed class EmbeddingOptions
     /// </summary>
     public string? QueryInstruction { get; set; } =
         "Given a developer's question about a codebase, retrieve the C# code that implements it.";
+
+    /// <summary>
+    /// Relevance floor for the vector branch of a search: a chunk whose cosine similarity to the
+    /// query falls below this value is excluded outright, never returned no matter how few other
+    /// candidates cleared the floor. Passed through to <see
+    /// cref="Search.VectorSearcher.Search(ReadOnlySpan{float}, int, float)"/>'s <c>minScore</c>
+    /// parameter by <see cref="Search.CodeIndexService"/>.
+    /// </summary>
+    /// <remarks>
+    /// <para>
+    /// <b>Why a floor is needed at all.</b> <see cref="Search.VectorSearcher"/> always returns
+    /// <c>min(topK, Count)</c> rows — whatever scored highest, however low that actually was. <see
+    /// cref="Search.HybridRanker"/>'s Reciprocal Rank Fusion then scores purely by rank position
+    /// within a branch, never by the underlying similarity value, so an unrelated project's (or an
+    /// off-topic/nonsense query's) merely-best-available match still receives "rank 1" and scores
+    /// identically to a genuinely strong match found elsewhere. Measured on a real project search
+    /// merging a real index with an unrelated seven-chunk project: the unrelated project's best
+    /// match scored cosine 0.071 against a query about trustline deletion, versus 0.9525 for the
+    /// true hit in the real index — yet both fused to the exact same RRF score, because RRF never
+    /// saw either raw number. A floor rejects the 0.071 before it ever reaches fusion, so it can
+    /// no longer masquerade as a peer of the 0.9525 hit.
+    /// </para>
+    /// <para>
+    /// <b>Where <c>0.55</c> (the default) comes from.</b> Measured against the project's own
+    /// 8,751-chunk reference index (a 724-file C# SDK, <c>qwen3-embedding:4b</c>, 1024
+    /// dimensions), rank-1 cosine similarity for 14 genuine developer queries ("where do we
+    /// validate trustline deletion", "how is a payment transaction signed", "AMM pool trading
+    /// fee", "escrow finish transaction", etc.) ranged <b>0.6116 to 0.9131</b>. Rank-1 cosine
+    /// similarity for 11 queries with no genuine answer in the index (recipes, hiking, "asdkjfh
+    /// aslkdjf qwoeiru zxcvnm", ...) ranged <b>0.3321 to 0.5402</b> — the highest of which was the
+    /// gibberish query, which still landed near a generic <c>Program</c>/entry-point chunk purely
+    /// because embedding models bias toward *some* nearest neighbour even for meaningless input.
+    /// The two distributions never overlapped: every genuine query scored above 0.61, every
+    /// off-topic one below 0.55. <c>0.55</c> sits in that gap — above every measured noise score
+    /// (0.01 of margin above the worst case, the gibberish query) and comfortably below every
+    /// measured genuine score (0.06 of margin below the weakest case, "retry logic for failed
+    /// requests"). It is deliberately biased toward the noise side of the gap: a false negative
+    /// (a real but weakly-worded match dropped) degrades gracefully back to the symbol branch and
+    /// a rephrased query, while a false positive (noise let through) looks exactly like a genuine
+    /// rank-1 hit with nothing in the response to tell them apart (see the <c>score</c> field on a
+    /// <c>code_search</c> hit for the only signal that does survive).
+    /// </para>
+    /// <para>
+    /// This is specific to <c>qwen3-embedding:4b</c> at 1024 dimensions with the default <see
+    /// cref="QueryInstruction"/>: a different model, dimensionality, or instruction prefix shifts
+    /// both distributions and may need a different threshold. Re-measure with the same method
+    /// (rank-1 cosine for genuine vs. off-topic queries against a real index) before trusting this
+    /// default on a different configuration.
+    /// </para>
+    /// </remarks>
+    public double MinCosineSimilarity { get; set; } = DefaultMinCosineSimilarity;
 }
