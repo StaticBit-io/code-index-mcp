@@ -1,0 +1,10 @@
+<Solution>
+  <Folder Name="/src/">
+    <Project Path="src/CodeIndex.Core/CodeIndex.Core.csproj" />
+    <Project Path="src/CodeIndex.Server/CodeIndex.Server.csproj" />
+  </Folder>
+  <Folder Name="/tests/">
+    <Project Path="tests/CodeIndex.Core.Tests/CodeIndex.Core.Tests.csproj" />
+    <Project Path="tests/CodeIndex.Server.Tests/CodeIndex.Server.Tests.csproj" />
+  </Folder>
+</Solution>
