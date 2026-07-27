@@ -561,6 +561,20 @@ public sealed partial class CodeSearchToolsTests : IDisposable
     }
 
     [Fact]
+    public async Task CodeSearch_WithProject_NegativeLimit_ReturnsReadableErrorRatherThanThrowing()
+    {
+        WriteFile("src/A.cs", MakeSimpleFile("Acme.A", "Widget", "DoA"));
+        CodeSearchTools tools = CreateTools(new StubEmbeddingClient());
+
+        string json = await tools.SearchAsync(
+            "DoA", limit: -3, kind: null, path_filter: null, project: DefaultProjectId, TestContext.Current.CancellationToken);
+
+        using JsonDocument document = JsonDocument.Parse(json);
+        Assert.True(document.RootElement.TryGetProperty("error", out JsonElement errorElement));
+        Assert.Contains("negative", errorElement.GetString(), StringComparison.OrdinalIgnoreCase);
+    }
+
+    [Fact]
     public async Task CodeSearch_HitPayload_CarriesAScoreField()
     {
         WriteFile("src/A.cs", MakeSimpleFile("Acme.A", "Widget", "DoSomething"));

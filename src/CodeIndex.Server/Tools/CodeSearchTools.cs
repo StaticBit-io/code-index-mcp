@@ -101,7 +101,10 @@ public sealed class CodeSearchTools
     public async Task<string> SearchAsync(
         [Description("Natural-language question or exact identifier/symbol name to search for.")]
         string query,
-        [Description("Maximum number of hits to return. Default 10.")]
+        [Description("Maximum number of hits to return. Default 10. Must not be negative (0 is " +
+            "valid and returns no hits). Not silently capped: a large limit searches deeper into " +
+            "both the semantic and symbol branches to try to satisfy it, bounded only by how many " +
+            "chunks exist (or match 'kind'/'path_filter').")]
         int limit = 10,
         [Description("Optional filter restricting results to one chunk kind: Class, Interface, " +
             "Struct, Record, Enum, Method, Constructor, Property, Field, or FileFragment. " +
