@@ -1,3 +1,4 @@
+using System.Diagnostics;
 using CodeIndex.Core.Sources;
 using Xunit;
 
@@ -71,5 +72,226 @@ public sealed class FileSystemSourceProviderTests : IDisposable
         string text = await provider.ReadLinesAsync("src/CrLf.cs", 2, 3, TestContext.Current.CancellationToken);
 
         Assert.Equal("line2\nline3", text);
+    }
+
+    // --- Containment: relativePath cannot walk or jump outside _root, symlinks aside -------
+
+    [Fact]
+    public async Task ReadTextAsync_RelativePathWithParentSegments_ThrowsRatherThanEscapingRoot()
+    {
+        string secretDirectory = Path.Combine(Path.GetTempPath(), "ci-outside-" + Guid.NewGuid().ToString("N"));
+        Directory.CreateDirectory(secretDirectory);
+        try
+        {
+            File.WriteAllText(Path.Combine(secretDirectory, "secret.cs"), "top secret");
+            FileSystemSourceProvider provider = new(_root);
+
+            // "src/../../ci-outside-.../secret.cs" walks out of _root via '..' segments —
+            // Resolve() must reject this rather than silently reading the escaped file.
+            string relativeName = Path.GetFileName(secretDirectory);
+            string escaping = $"src/../../{relativeName}/secret.cs";
+
+            await Assert.ThrowsAsync<UnauthorizedAccessException>(
+                () => provider.ReadTextAsync(escaping, TestContext.Current.CancellationToken));
+        }
+        finally
+        {
+            Directory.Delete(secretDirectory, recursive: true);
+        }
+    }
+
+    [Fact]
+    public async Task ReadTextAsync_AbsoluteRelativePath_ThrowsRatherThanEscapingRoot()
+    {
+        // Path.Combine(root, relativePath) returns relativePath unchanged when it is itself
+        // rooted, so an absolute "relativePath" (e.g. a corrupted manifest, or a bug upstream)
+        // would otherwise read straight through to an arbitrary file on disk.
+        string secretFile = Path.Combine(Path.GetTempPath(), "ci-outside-" + Guid.NewGuid().ToString("N") + ".cs");
+        File.WriteAllText(secretFile, "top secret");
+        try
+        {
+            FileSystemSourceProvider provider = new(_root);
+
+            await Assert.ThrowsAsync<UnauthorizedAccessException>(
+                () => provider.ReadTextAsync(secretFile, TestContext.Current.CancellationToken));
+        }
+        finally
+        {
+            File.Delete(secretFile);
+        }
+    }
+
+    // --- Symlinks: never followed, neither to escape the root nor to loop forever ----------
+
+    [Fact]
+    public async Task EnumerateAsync_SkipsSymlinkedFile_EvenNamedWithCsExtension()
+    {
+        string secretFile = Path.Combine(Path.GetTempPath(), "ci-secret-" + Guid.NewGuid().ToString("N") + ".txt");
+        File.WriteAllText(secretFile, "-----BEGIN OPENSSH PRIVATE KEY-----");
+        string linkPath = Path.Combine(_root, "src", "Config.cs");
+
+        try
+        {
+            if (!TryCreateFileSymlink(linkPath, secretFile))
+            {
+                Assert.Skip("This environment cannot create file symlinks (needs Developer Mode " +
+                    "or elevation on Windows); the containment logic is still exercised on CI.");
+                return;
+            }
+
+            FileSystemSourceProvider provider = new(_root);
+
+            List<string> found = new();
+            await foreach (string path in provider.EnumerateAsync(TestContext.Current.CancellationToken))
+                found.Add(path);
+
+            // The symlinked "src/Config.cs" must never be enumerated: its target is outside
+            // the project root entirely and the *.cs filter only constrains the link's name.
+            Assert.DoesNotContain("src/Config.cs", found);
+            Assert.Equal(new[] { "src/A.cs" }, found);
+        }
+        finally
+        {
+            SafeDeleteLink(linkPath);
+            File.Delete(secretFile);
+        }
+    }
+
+    [Fact]
+    public async Task EnumerateAsync_SkipsSymlinkedDirectory_NeverDescendingIntoIt()
+    {
+        string secretDirectory = Path.Combine(Path.GetTempPath(), "ci-secret-dir-" + Guid.NewGuid().ToString("N"));
+        Directory.CreateDirectory(secretDirectory);
+        File.WriteAllText(Path.Combine(secretDirectory, "Secret.cs"), "outside the project entirely");
+        string linkPath = Path.Combine(_root, "src", "linked");
+
+        try
+        {
+            if (!TryCreateDirectorySymlinkOrJunction(linkPath, secretDirectory))
+            {
+                Assert.Skip("This environment cannot create directory symlinks/junctions.");
+                return;
+            }
+
+            FileSystemSourceProvider provider = new(_root);
+
+            List<string> found = new();
+            await foreach (string path in provider.EnumerateAsync(TestContext.Current.CancellationToken))
+                found.Add(path);
+
+            Assert.DoesNotContain(found, p => p.Contains("Secret.cs", StringComparison.Ordinal));
+            Assert.Equal(new[] { "src/A.cs" }, found);
+        }
+        finally
+        {
+            // Remove the link itself first — before deleting its target — so cleanup never
+            // depends on whatever Directory.Delete(_root, recursive: true) in Dispose() would
+            // otherwise do with a directory reparse point still in the tree.
+            SafeDeleteLink(linkPath);
+            Directory.Delete(secretDirectory, recursive: true);
+        }
+    }
+
+    [Fact]
+    public async Task EnumerateAsync_DirectoryLinkPointingAtItsOwnAncestor_TerminatesRatherThanLoopingForever()
+    {
+        string linkPath = Path.Combine(_root, "src", "cycle");
+
+        // A junction/symlink inside src/ pointing back at _root itself — walking into it would
+        // find src/cycle again, and src/cycle/cycle, forever, if reparse points were followed.
+        if (!TryCreateDirectorySymlinkOrJunction(linkPath, _root))
+        {
+            Assert.Skip("This environment cannot create directory symlinks/junctions.");
+            return;
+        }
+
+        try
+        {
+            FileSystemSourceProvider provider = new(_root);
+
+            List<string> found = new();
+            using CancellationTokenSource cts = new(TimeSpan.FromSeconds(30));
+            await foreach (string path in provider.EnumerateAsync(cts.Token))
+                found.Add(path);
+
+            // Terminates (the 30s cap above would otherwise fail the test with an
+            // OperationCanceledException) and never follows the cycle into the linked copy.
+            Assert.Equal(new[] { "src/A.cs" }, found);
+        }
+        finally
+        {
+            // The link points at _root itself, so leaving it in place would make Dispose()'s
+            // Directory.Delete(_root, recursive: true) walk a self-referential tree; remove it
+            // first so cleanup does not depend on how that call treats a directory cycle.
+            SafeDeleteLink(linkPath);
+        }
+    }
+
+    /// <summary>Removes just the reparse point at <paramref name="linkPath"/> — never its
+    /// target's contents — regardless of whether it is a file symlink or a directory
+    /// symlink/junction. A plain (non-recursive) <see cref="Directory.Delete(string)"/> on a
+    /// directory reparse point removes only the link entry, matching what <c>rmdir</c> on a
+    /// symlink/junction does on both Windows and Unix.</summary>
+    private static void SafeDeleteLink(string linkPath)
+    {
+        try
+        {
+            if (File.Exists(linkPath))
+                File.Delete(linkPath);
+            else if (Directory.Exists(linkPath))
+                Directory.Delete(linkPath);
+        }
+        catch (IOException)
+        {
+            // Best-effort cleanup; the containing _root gets torn down by Dispose() regardless.
+        }
+    }
+
+    private static bool TryCreateFileSymlink(string linkPath, string targetPath)
+    {
+        try
+        {
+            File.CreateSymbolicLink(linkPath, targetPath);
+            return true;
+        }
+        catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
+        {
+            return false;
+        }
+    }
+
+    /// <summary>Directory symlink on Unix; a Windows junction on Windows. Windows directory
+    /// symlinks need Developer Mode or elevation in most environments, but junctions do not —
+    /// and a junction is exactly what the exploit report used to reproduce the infinite-loop
+    /// bug, so it is the more faithful reproduction on that platform anyway.</summary>
+    private static bool TryCreateDirectorySymlinkOrJunction(string linkPath, string targetPath)
+    {
+        try
+        {
+            if (OperatingSystem.IsWindows())
+                return TryCreateWindowsJunction(linkPath, targetPath);
+
+            Directory.CreateSymbolicLink(linkPath, targetPath);
+            return true;
+        }
+        catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
+        {
+            return false;
+        }
+    }
+
+    private static bool TryCreateWindowsJunction(string linkPath, string targetPath)
+    {
+        ProcessStartInfo startInfo = new("cmd.exe", $"/c mklink /J \"{linkPath}\" \"{targetPath}\"")
+        {
+            RedirectStandardOutput = true,
+            RedirectStandardError = true,
+            UseShellExecute = false,
+            CreateNoWindow = true,
+        };
+
+        using Process? process = Process.Start(startInfo);
+        process?.WaitForExit();
+        return process is { ExitCode: 0 };
     }
 }
