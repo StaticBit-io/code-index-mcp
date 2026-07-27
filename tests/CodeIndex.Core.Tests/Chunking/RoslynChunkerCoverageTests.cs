@@ -247,6 +247,32 @@ public sealed class RoslynChunkerCoverageTests
     }
 
     [Fact]
+    public void Chunk_TypeLevelChunkListsOperatorsIndexersAndNestedDelegatesAsMembers()
+    {
+        // The type-level chunk's body is the comma-joined member name list built by
+        // GetMemberDisplayNames; every kind indexed as its own member chunk elsewhere must also
+        // show up here, or semantic search against "the type as a whole" loses that signal.
+        const string source = """
+            namespace Acme;
+
+            public readonly struct Amount
+            {
+                public static Amount operator *(Amount left, Amount right) => left;
+                public static implicit operator string(Amount value) => value.ToString();
+                public string this[string key] => key;
+                public delegate void Callback();
+            }
+            """;
+
+        CodeChunk type = _chunker.Chunk("Amount.cs", source).Single(c => c.Kind == ChunkKind.Struct);
+
+        Assert.Contains("operator *", type.EmbedText, StringComparison.Ordinal);
+        Assert.Contains("implicit operator string", type.EmbedText, StringComparison.Ordinal);
+        Assert.Contains("this[]", type.EmbedText, StringComparison.Ordinal);
+        Assert.Contains("Callback", type.EmbedText, StringComparison.Ordinal);
+    }
+
+    [Fact]
     public void Chunk_StripsXmlTagsFromDocCommentKeepingText()
     {
         const string source = """
@@ -310,14 +336,19 @@ public sealed class RoslynChunkerCoverageTests
     public void Chunk_TruncatesBodyWithoutSplittingSurrogatePair()
     {
         // Craft a method whose source text is long enough to be truncated at exactly the
-        // 2000-character boundary, with a surrogate pair (an emoji) straddling that
-        // boundary: the high surrogate lands as the last character a naive Substring(0,
-        // 2000) would keep, orphaning its low-surrogate partner just past the cut.
+        // ChunkTextLimits.MaxBodyLength (2000-character) boundary, with a surrogate pair (an
+        // emoji) straddling that boundary: the high surrogate lands as the last character a
+        // naive Substring(0, 2000) would keep, orphaning its low-surrogate partner just past
+        // the cut. ChunkTextLimits is internal to CodeIndex.Core (no InternalsVisibleTo to this
+        // test assembly), so the boundary is mirrored here as a literal rather than referenced
+        // directly — kept in sync by the two assertions below, which fail loudly if this test's
+        // 2000/1999 drifts from the real limit instead of quietly asserting nothing.
+        const int maxBodyLength = 2000;
         const string emoji = "😀";
         const string prefix = "public void Big() { /*";
         const string suffix = "*/ }";
 
-        string filler = new string('a', 1999 - prefix.Length);
+        string filler = new string('a', (maxBodyLength - 1) - prefix.Length);
         string methodBody = prefix + filler + emoji + suffix;
         string source = $$"""
             namespace Acme;
@@ -333,6 +364,13 @@ public sealed class RoslynChunkerCoverageTests
         int codeIndex = method.EmbedText.IndexOf("Code:\n", StringComparison.Ordinal) + "Code:\n".Length;
         string codeSection = method.EmbedText[codeIndex..];
 
+        // The fixture's raw method body is well over the limit, so if truncation silently
+        // stopped happening (e.g. ChunkTextLimits.MaxBodyLength changed or the truncation call
+        // was dropped) this would catch it — a same-length comparison would leave the surrogate
+        // assertion below vacuously true regardless of whether truncation actually ran.
+        Assert.True(codeSection.Length < methodBody.Length,
+            "expected the body to be truncated; fixture and limit may have drifted apart");
+        Assert.True(codeSection.Length <= maxBodyLength);
         Assert.False(char.IsHighSurrogate(codeSection[^1]));
     }
 }

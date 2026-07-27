@@ -384,6 +384,10 @@ public sealed partial class RoslynChunker
         PropertyDeclarationSyntax property => [property.Identifier.Text],
         FieldDeclarationSyntax field => field.Declaration.Variables.Select(v => v.Identifier.Text),
         EventFieldDeclarationSyntax eventField => eventField.Declaration.Variables.Select(v => v.Identifier.Text),
+        IndexerDeclarationSyntax => ["this[]"],
+        OperatorDeclarationSyntax op => [$"operator {op.OperatorToken.Text}"],
+        ConversionOperatorDeclarationSyntax conv => [$"{conv.ImplicitOrExplicitKeyword.Text} operator {conv.Type}"],
+        DelegateDeclarationSyntax nestedDelegate => [nestedDelegate.Identifier.Text],
         BaseTypeDeclarationSyntax { Identifier.Text.Length: > 0 } nested => [nested.Identifier.Text],
         _ => [],
     };
