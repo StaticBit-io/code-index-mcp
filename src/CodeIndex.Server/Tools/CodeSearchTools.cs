@@ -4,6 +4,7 @@ using System.Text.Json;
 using System.Text.Json.Serialization;
 using CodeIndex.Core;
 using CodeIndex.Core.Chunking;
+using CodeIndex.Core.Embedding;
 using CodeIndex.Core.Search;
 using CodeIndex.Core.Storage;
 using ModelContextProtocol.Server;
@@ -117,22 +118,32 @@ public sealed class CodeSearchTools
 
         if (project is not null)
         {
-            CodeIndexService service;
             try
             {
-                service = _registry.GetService(project);
+                CodeIndexService service = _registry.GetService(project);
+
+                SearchResult result = await service
+                    .SearchWithStatusAsync(query, limit, parsedKind, path_filter, cancellationToken);
+
+                count = result.Hits.Count;
+                warning = result.Warning;
+                hitPayloads = result.Hits.Select(hit => BuildHitPayload(project, hit));
             }
-            catch (Exception ex) when (ex is UnknownProjectException or ProjectUnavailableException)
+            catch (Exception ex) when (IsReportableToolFailure(ex))
             {
+                // Covers both "project resolution failed" (Unknown/ProjectUnavailable) and
+                // "the search itself failed" (EmbeddingUnavailable from a refresh that could not
+                // fall back — see CodeIndexService.RefreshOrFallBackAsync — or an ArgumentException
+                // from an invalid query/limit). Without this, everything but the first kind escapes
+                // to the MCP SDK, which replaces it with a generic "An error occurred invoking
+                // 'code_search'." and throws away the specific, actionable message underneath
+                // (e.g. "Start it with 'ollama serve'"). The project-omitted branch below already
+                // gets this right for free: ProjectRegistry.SearchAllAsync/SearchOneAsync catch
+                // every per-project failure and fold it into the warning field instead of throwing,
+                // so a single-project call must not behave differently just because `project` was
+                // passed explicitly — the response shape must not depend on an optional parameter.
                 return ErrorPayload(ex.Message);
             }
-
-            SearchResult result = await service
-                .SearchWithStatusAsync(query, limit, parsedKind, path_filter, cancellationToken);
-
-            count = result.Hits.Count;
-            warning = result.Warning;
-            hitPayloads = result.Hits.Select(hit => BuildHitPayload(project, hit));
         }
         else
         {
@@ -171,17 +182,16 @@ public sealed class CodeSearchTools
                 "returned by code_search's 'id' field, e.g. \"xrpl:4137\".");
         }
 
-        CodeIndexService service;
+        SearchHit? hit;
         try
         {
-            service = _registry.GetService(parsed.ProjectId);
+            CodeIndexService service = _registry.GetService(parsed.ProjectId);
+            hit = await service.GetChunkAsync(parsed.ChunkId, cancellationToken);
         }
-        catch (Exception ex) when (ex is UnknownProjectException or ProjectUnavailableException)
+        catch (Exception ex) when (IsReportableToolFailure(ex))
         {
             return ErrorPayload(ex.Message);
         }
-
-        SearchHit? hit = await service.GetChunkAsync(parsed.ChunkId, cancellationToken);
 
         if (hit is null)
         {
@@ -219,20 +229,24 @@ public sealed class CodeSearchTools
     {
         if (project is not null)
         {
-            CodeIndexService service;
-            ProjectOptions projectOptions;
             try
             {
-                service = _registry.GetService(project);
-                projectOptions = _registry.GetProjectOptions(project);
+                CodeIndexService service = _registry.GetService(project);
+                ProjectOptions projectOptions = _registry.GetProjectOptions(project);
+
+                ProjectStatusEntry entry = await BuildStatusEntryAsync(project, service, projectOptions, cancellationToken);
+                return JsonSerializer.Serialize(entry, SerializerOptions);
             }
-            catch (Exception ex) when (ex is UnknownProjectException or ProjectUnavailableException)
+            catch (Exception ex) when (IsReportableToolFailure(ex))
             {
+                // BuildStatusEntryAsync deliberately lets a refresh failure propagate for an
+                // explicit single-project ask (see its own remarks: "a raw, specific failure is
+                // more useful than a silently degraded result" for status specifically) — that
+                // design choice is unchanged. What was broken is that the raw failure used to
+                // escape uncaught to the MCP SDK's generic wrapper instead of reaching the caller
+                // at all; this catch is what makes "raw" actually mean "readable."
                 return ErrorPayload(ex.Message);
             }
-
-            ProjectStatusEntry entry = await BuildStatusEntryAsync(project, service, projectOptions, cancellationToken);
-            return JsonSerializer.Serialize(entry, SerializerOptions);
         }
 
         Task<ProjectStatusEntry>[] tasks = _registry.ProjectIds
@@ -255,17 +269,17 @@ public sealed class CodeSearchTools
     {
         if (project is not null)
         {
-            CodeIndexService service;
+            IndexSnapshot snapshot;
             try
             {
-                service = _registry.GetService(project);
+                CodeIndexService service = _registry.GetService(project);
+                snapshot = await service.RebuildAsync(cancellationToken);
             }
-            catch (Exception ex) when (ex is UnknownProjectException or ProjectUnavailableException)
+            catch (Exception ex) when (IsReportableToolFailure(ex))
             {
                 return ErrorPayload(ex.Message);
             }
 
-            IndexSnapshot snapshot = await service.RebuildAsync(cancellationToken);
             ProjectReindexEntry entry = new()
             {
                 ProjectId = project,
@@ -298,7 +312,27 @@ public sealed class CodeSearchTools
         signature = hit.Chunk.Signature,
         doc = string.IsNullOrEmpty(hit.Chunk.DocComment) ? null : hit.Chunk.DocComment,
         excerpt = hit.Excerpt,
+        score = hit.Score,
     };
+
+    /// <summary>
+    /// True for every exception a single-project tool call should turn into a readable <see
+    /// cref="ErrorPayload"/> instead of letting it escape to the MCP SDK, which replaces any
+    /// uncaught exception with an uninformative "An error occurred invoking '&lt;tool&gt;'." —
+    /// throwing away messages that are written to name the exact remedy (e.g. "Start it with
+    /// 'ollama serve'", or "Duplicate project id ... must be unique"). Covers project-resolution
+    /// failures (<see cref="UnknownProjectException"/>, <see cref="ProjectUnavailableException"/>),
+    /// embedding-backend failures (<see cref="EmbeddingUnavailableException"/> — from a refresh
+    /// that could not even fall back to a stale snapshot, or an explicit code_reindex with no
+    /// working embedder), and invalid-input/configuration failures (<see cref="ArgumentException"/>
+    /// — a blank query, a negative limit, or a config problem surfacing lazily). The
+    /// project-omitted ("search/status/reindex every project") paths never need this: <see
+    /// cref="ProjectRegistry.SearchAllAsync"/> and the <c>BuildXxxEntryForAggregateAsync</c>
+    /// helpers below already catch every per-project failure themselves and fold it into a
+    /// warning/error field, so nothing from that path reaches here to begin with.
+    /// </summary>
+    private static bool IsReportableToolFailure(Exception ex) =>
+        ex is UnknownProjectException or ProjectUnavailableException or EmbeddingUnavailableException or ArgumentException;
 
     /// <summary>Builds one project's status entry, letting any failure (most commonly
     /// <see cref="CodeIndex.Core.Embedding.EmbeddingUnavailableException"/> from the mandatory
