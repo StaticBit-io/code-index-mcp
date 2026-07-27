@@ -10,6 +10,16 @@ public sealed class FileSystemSourceProvider : ISourceProvider
 
     public FileSystemSourceProvider(string root) => _root = Path.GetFullPath(root);
 
+    /// <summary>
+    /// Whether <paramref name="root"/> exists on disk, without constructing a provider for it.
+    /// Exists so a caller that needs to check a candidate project root before committing to build
+    /// one (see <c>Search.ProjectRegistry</c>) still only ever touches <see cref="Directory"/>
+    /// from within this sanctioned namespace — see the exemption <c>SourceIsolationTests</c>
+    /// grants this namespace, which this method deliberately stays inside of rather than
+    /// bypassing.
+    /// </summary>
+    public static bool RootExists(string root) => Directory.Exists(root);
+
     public async IAsyncEnumerable<string> EnumerateAsync(
         [EnumeratorCancellation] CancellationToken cancellationToken)
     {

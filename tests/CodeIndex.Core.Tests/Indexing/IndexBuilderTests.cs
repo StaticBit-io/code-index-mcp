@@ -41,7 +41,7 @@ public sealed class IndexBuilderTests : IDisposable
         string directory = subDirectory is null ? _dir : Path.Combine(_dir, subDirectory);
         store = new IndexStore(directory);
         ChunkerPipeline pipeline = new(new RoslynChunker(), new FallbackChunker());
-        CodeIndexOptions options = new() { ProjectId = "test-project" };
+        CodeIndexOptions options = new();
         return new IndexBuilder(source, pipeline, embedder, store, Options.Create(options));
     }
 

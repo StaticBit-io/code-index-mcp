@@ -55,7 +55,7 @@ public sealed class SearchQualityTests : IDisposable
 
         IndexStore store = new(_dir);
         ChunkerPipeline pipeline = new(new RoslynChunker(), new FallbackChunker());
-        CodeIndexOptions options = new() { ProjectId = "search-quality-test" };
+        CodeIndexOptions options = new();
         IndexBuilder builder = new(source, pipeline, embedder, store, Options.Create(options));
         return new CodeIndexService(builder, source, embedder);
     }

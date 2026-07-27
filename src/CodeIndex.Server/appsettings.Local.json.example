@@ -1,6 +1,14 @@
 {
   "CodeIndex": {
-    "ProjectId": "myproject",
-    "ProjectRoot": "/path/to/MyProject"
+    "Projects": [
+      {
+        "Id": "myproject",
+        "Root": "/path/to/MyProject"
+      },
+      {
+        "Id": "otherproject",
+        "Root": "/path/to/OtherProject"
+      }
+    ]
   }
 }

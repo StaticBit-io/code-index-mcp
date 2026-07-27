@@ -52,10 +52,11 @@ public sealed class IndexBuilder
         _indexStore = indexStore;
         _options = options.Value;
 
-        // Fail fast: a bad EmbedBatchSize (see EmbedTextsAsync) or an unsafe ProjectId (see
-        // CodeIndexOptions.ResolveCacheDirectory) should surface here, not as an obscure
-        // batching or path bug much later.
-        _options.Validate();
+        // Fail fast: a bad EmbedBatchSize (see EmbedTextsAsync) should surface here, not as an
+        // obscure batching bug much later. Project-id/cache-path validation is the registry's
+        // job (see ProjectRegistry) — this builder is already rooted at a resolved IndexStore
+        // directory and never touches ProjectOptions.Id itself.
+        _options.ValidateEmbedBatchSize();
     }
 
     /// <summary>

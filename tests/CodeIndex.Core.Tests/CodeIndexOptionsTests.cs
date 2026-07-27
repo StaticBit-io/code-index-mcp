@@ -4,68 +4,69 @@ namespace CodeIndex.Core.Tests;
 
 public sealed class CodeIndexOptionsTests
 {
-    [Fact]
-    public void ResolveCacheDirectory_JoinsLocalAppDataWithProductNameAndProjectId()
+    private static CodeIndexOptions MakeValidOptions() => new()
     {
-        CodeIndexOptions options = new() { ProjectId = "my-project" };
-
-        string resolved = options.ResolveCacheDirectory();
-
-        string expected = Path.Combine(
-            Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData),
-            "code-index-mcp",
-            "my-project");
-        Assert.Equal(expected, resolved);
-    }
+        Projects = [new ProjectOptions { Id = "one", Root = "/one" }],
+    };
 
     [Fact]
-    public void ResolveCacheDirectory_ReturnsCacheDirectoryVerbatimWhenSet_EvenWithAnUnsafeProjectId()
+    public void Validate_AcceptsASingleValidProject()
     {
-        // CacheDirectory bypasses ProjectId entirely, so an otherwise-invalid ProjectId must not
-        // matter when CacheDirectory is set explicitly.
-        CodeIndexOptions options = new() { ProjectId = "../escaped", CacheDirectory = @"C:\explicit\cache" };
-
-        Assert.Equal(@"C:\explicit\cache", options.ResolveCacheDirectory());
-    }
-
-    [Theory]
-    [InlineData("")]
-    [InlineData("C:\\Temp\\x")]
-    [InlineData("/etc/passwd")]
-    [InlineData("a/b")]
-    [InlineData("a\\b")]
-    [InlineData("..")]
-    [InlineData("../other")]
-    [InlineData("foo..bar")]
-    [InlineData("bad:name")]
-    [InlineData("bad*name")]
-    public void ResolveCacheDirectory_ThrowsForAnUnsafeProjectId(string projectId)
-    {
-        CodeIndexOptions options = new() { ProjectId = projectId };
-
-        Assert.Throws<ArgumentException>(() => options.ResolveCacheDirectory());
-    }
-
-    [Theory]
-    [InlineData("default")]
-    [InlineData("my-project_123")]
-    [InlineData("MyProject.Core")]
-    public void ResolveCacheDirectory_AcceptsOrdinaryProjectIds(string projectId)
-    {
-        CodeIndexOptions options = new() { ProjectId = projectId };
-
-        string resolved = options.ResolveCacheDirectory();
-
-        Assert.EndsWith(projectId, resolved, StringComparison.Ordinal);
-    }
-
-    [Fact]
-    public void Validate_AcceptsTheDefaults()
-    {
-        CodeIndexOptions options = new();
+        CodeIndexOptions options = MakeValidOptions();
 
         // Must not throw.
         options.Validate();
+    }
+
+    [Fact]
+    public void Validate_AcceptsMultipleProjectsWithDistinctIds()
+    {
+        CodeIndexOptions options = new()
+        {
+            Projects =
+            [
+                new ProjectOptions { Id = "one", Root = "/one" },
+                new ProjectOptions { Id = "two", Root = "/two" },
+            ],
+        };
+
+        // Must not throw.
+        options.Validate();
+    }
+
+    [Fact]
+    public void Validate_ThrowsWhenNoProjectsAreConfigured()
+    {
+        CodeIndexOptions options = new();
+
+        Assert.Throws<ArgumentException>(() => options.Validate());
+    }
+
+    [Fact]
+    public void Validate_ThrowsForDuplicateProjectIds()
+    {
+        CodeIndexOptions options = new()
+        {
+            Projects =
+            [
+                new ProjectOptions { Id = "dup", Root = "/one" },
+                new ProjectOptions { Id = "dup", Root = "/two" },
+            ],
+        };
+
+        ArgumentException ex = Assert.Throws<ArgumentException>(() => options.Validate());
+        Assert.Contains("dup", ex.Message, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public void Validate_ThrowsWhenAProjectIdIsUnsafe()
+    {
+        CodeIndexOptions options = new()
+        {
+            Projects = [new ProjectOptions { Id = "../escaped", Root = "/one" }],
+        };
+
+        Assert.Throws<ArgumentException>(() => options.Validate());
     }
 
     [Theory]
@@ -73,16 +74,29 @@ public sealed class CodeIndexOptionsTests
     [InlineData(-1)]
     public void Validate_ThrowsWhenEmbedBatchSizeIsNotPositive(int embedBatchSize)
     {
-        CodeIndexOptions options = new() { EmbedBatchSize = embedBatchSize };
+        CodeIndexOptions options = MakeValidOptions();
+        options.EmbedBatchSize = embedBatchSize;
 
         Assert.Throws<ArgumentOutOfRangeException>(() => options.Validate());
     }
 
-    [Fact]
-    public void Validate_ThrowsForAnUnsafeProjectIdEvenWhenEmbedBatchSizeIsFine()
+    [Theory]
+    [InlineData(0)]
+    [InlineData(-1)]
+    public void ValidateEmbedBatchSize_ThrowsWhenNotPositive_WithoutRequiringAnyProjects(int embedBatchSize)
     {
-        CodeIndexOptions options = new() { ProjectId = "../escaped" };
+        CodeIndexOptions options = new() { EmbedBatchSize = embedBatchSize };
 
-        Assert.Throws<ArgumentException>(() => options.Validate());
+        Assert.Throws<ArgumentOutOfRangeException>(() => options.ValidateEmbedBatchSize());
+    }
+
+    [Fact]
+    public void ValidateEmbedBatchSize_AcceptsTheDefault_WithoutRequiringAnyProjects()
+    {
+        CodeIndexOptions options = new();
+
+        // Must not throw, even with an empty Projects list: IndexBuilder only ever needs
+        // EmbedBatchSize validated, never the whole multi-project configuration.
+        options.ValidateEmbedBatchSize();
     }
 }

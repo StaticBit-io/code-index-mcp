@@ -2,9 +2,7 @@ using System.Diagnostics;
 using CodeIndex.Core;
 using CodeIndex.Core.Chunking;
 using CodeIndex.Core.Embedding;
-using CodeIndex.Core.Indexing;
 using CodeIndex.Core.Search;
-using CodeIndex.Core.Sources;
 using CodeIndex.Core.Storage;
 using Microsoft.Extensions.Configuration;
 using Microsoft.Extensions.DependencyInjection;
@@ -40,8 +38,8 @@ public static class Program
         builder.Logging.ClearProviders();
         builder.Logging.AddConsole(options => options.LogToStandardErrorThreshold = LogLevel.Trace);
 
-        // appsettings.Local.json is gitignored and lets each developer point ProjectRoot at
-        // their own machine without ever risking a commit of that path into appsettings.json.
+        // appsettings.Local.json is gitignored and lets each developer point CodeIndex:Projects at
+        // their own machine without ever risking a commit of those paths into appsettings.json.
         builder.Configuration
             .AddJsonFile("appsettings.json", optional: true, reloadOnChange: false)
             .AddJsonFile("appsettings.Local.json", optional: true, reloadOnChange: false)
@@ -50,6 +48,8 @@ public static class Program
         builder.Services.Configure<CodeIndexOptions>(builder.Configuration.GetSection(CodeIndexOptions.SectionName));
         builder.Services.Configure<EmbeddingOptions>(builder.Configuration.GetSection(EmbeddingOptions.SectionName));
 
+        // One embedding client for every configured project: it is a stateless HTTP client
+        // pointed at one Ollama endpoint, not something rooted at a particular project's files.
         builder.Services.AddHttpClient<IEmbeddingClient, OllamaEmbeddingClient>((serviceProvider, client) =>
         {
             EmbeddingOptions embeddingOptions = serviceProvider.GetRequiredService<IOptions<EmbeddingOptions>>().Value;
@@ -61,28 +61,17 @@ public static class Program
         builder.Services.AddSingleton<FallbackChunker>();
         builder.Services.AddSingleton<ChunkerPipeline>();
 
-        builder.Services.AddSingleton<ISourceProvider>(serviceProvider =>
-        {
-            CodeIndexOptions options = serviceProvider.GetRequiredService<IOptions<CodeIndexOptions>>().Value;
-            if (string.IsNullOrWhiteSpace(options.ProjectRoot))
-            {
-                throw new InvalidOperationException(
-                    $"{CodeIndexOptions.SectionName}:{nameof(CodeIndexOptions.ProjectRoot)} is not set. " +
-                    "Configure it in appsettings.json, or via the " +
-                    $"CODEINDEX_{CodeIndexOptions.SectionName}__{nameof(CodeIndexOptions.ProjectRoot)} environment variable.");
-            }
-
-            return new FileSystemSourceProvider(options.ProjectRoot);
-        });
-
+        // ProjectRegistry owns one ISourceProvider/IndexStore/IndexBuilder/CodeIndexService per
+        // configured project — see its class remarks for why constructing it here is cheap
+        // (no project I/O beyond a directory-existence check) and why one project's bad Root
+        // does not prevent the others from working.
         builder.Services.AddSingleton(serviceProvider =>
         {
             CodeIndexOptions options = serviceProvider.GetRequiredService<IOptions<CodeIndexOptions>>().Value;
-            return new IndexStore(options.ResolveCacheDirectory());
+            ChunkerPipeline chunkerPipeline = serviceProvider.GetRequiredService<ChunkerPipeline>();
+            IEmbeddingClient embeddingClient = serviceProvider.GetRequiredService<IEmbeddingClient>();
+            return new ProjectRegistry(options, chunkerPipeline, embeddingClient);
         });
-
-        builder.Services.AddSingleton<IndexBuilder>();
-        builder.Services.AddSingleton<CodeIndexService>();
 
         builder.Services
             .AddMcpServer()
@@ -111,13 +100,13 @@ public static class Program
     }
 
     /// <summary>
-    /// Runs a maintenance-flag action and turns any failure — most commonly
-    /// <see cref="EmbeddingUnavailableException"/> when Ollama is not running, or the
-    /// ProjectRoot/config error thrown while resolving <see cref="ISourceProvider"/> — into a
-    /// single actionable line on stderr and a non-zero exit code, instead of letting a raw .NET
-    /// stack trace fall out of Main. Both action's own exception messages are already written to
-    /// name the exact remedy (e.g. "Start it with 'ollama serve'"), so nothing here needs to
-    /// interpret which failure occurred.
+    /// Runs a maintenance-flag action and turns any failure — most commonly a configuration error
+    /// (bad CodeIndex:Projects entries, e.g. a duplicate id) thrown while resolving
+    /// <see cref="ProjectRegistry"/>, or <see cref="EmbeddingUnavailableException"/> when Ollama is
+    /// not running — into a single actionable line on stderr and a non-zero exit code, instead of
+    /// letting a raw .NET stack trace fall out of Main. Both actions' own exception messages are
+    /// already written to name the exact remedy (e.g. "Start it with 'ollama serve'"), so nothing
+    /// here needs to interpret which failure occurred.
     /// </summary>
     private static async Task<int> RunGuardedAsync(Func<Task> action)
     {
@@ -133,52 +122,85 @@ public static class Program
         }
     }
 
+    /// <summary>Rebuilds every configured project from scratch. A single bad project (missing
+    /// root, or a genuine embedding failure) is reported and skipped rather than aborting the
+    /// whole run — see <see cref="RunGuardedAsync"/> for the one failure mode that still aborts
+    /// everything: a configuration problem in <see cref="CodeIndexOptions"/> itself.</summary>
     private static async Task RunBuildOnlyAsync(IServiceProvider services)
     {
-        CodeIndexService service = services.GetRequiredService<CodeIndexService>();
+        ProjectRegistry registry = services.GetRequiredService<ProjectRegistry>();
 
-        Stopwatch stopwatch = Stopwatch.StartNew();
-        IndexSnapshot snapshot = await service.RebuildAsync();
-        stopwatch.Stop();
+        foreach (string projectId in registry.ProjectIds)
+        {
+            Console.WriteLine($"Project: {projectId}");
 
-        Console.WriteLine("Rebuild complete.");
-        Console.WriteLine($"  Files:   {snapshot.Fingerprints.Count}");
-        Console.WriteLine($"  Chunks:  {snapshot.Chunks.Count}");
-        Console.WriteLine($"  Model:   {snapshot.Header.Model} ({snapshot.Header.Dimensions} dimensions)");
-        Console.WriteLine($"  Elapsed: {stopwatch.Elapsed.TotalSeconds:F1}s");
+            string? fault = registry.GetFaultMessage(projectId);
+            if (fault is not null)
+            {
+                Console.WriteLine($"  Error: {fault}");
+                continue;
+            }
+
+            CodeIndexService service = registry.GetService(projectId);
+
+            Stopwatch stopwatch = Stopwatch.StartNew();
+            IndexSnapshot snapshot = await service.RebuildAsync();
+            stopwatch.Stop();
+
+            Console.WriteLine("  Rebuild complete.");
+            Console.WriteLine($"    Files:   {snapshot.Fingerprints.Count}");
+            Console.WriteLine($"    Chunks:  {snapshot.Chunks.Count}");
+            Console.WriteLine($"    Model:   {snapshot.Header.Model} ({snapshot.Header.Dimensions} dimensions)");
+            Console.WriteLine($"    Elapsed: {stopwatch.Elapsed.TotalSeconds:F1}s");
+        }
     }
 
+    /// <summary>Reports status for every configured project. Like <see cref="RunBuildOnlyAsync"/>,
+    /// one project's fault is reported and skipped rather than aborting the whole run.</summary>
     private static async Task RunStatusAsync(IServiceProvider services)
     {
-        CodeIndexService service = services.GetRequiredService<CodeIndexService>();
-        CodeIndexOptions codeIndexOptions = services.GetRequiredService<IOptions<CodeIndexOptions>>().Value;
+        ProjectRegistry registry = services.GetRequiredService<ProjectRegistry>();
 
-        Stopwatch refreshStopwatch = Stopwatch.StartNew();
-        IndexSnapshot snapshot = await service.RefreshAsync();
-        refreshStopwatch.Stop();
-
-        Stopwatch queryStopwatch = Stopwatch.StartNew();
-        SearchResult result = await service.SearchWithStatusAsync(
-            "status check", limit: 1, kind: null, pathFilter: null);
-        queryStopwatch.Stop();
-
-        string cacheDirectory = codeIndexOptions.ResolveCacheDirectory();
-        long cacheSizeBytes = ComputeDirectorySize(cacheDirectory);
-
-        Console.WriteLine("CodeIndex status");
-        Console.WriteLine($"  Project:            {codeIndexOptions.ProjectId} ({codeIndexOptions.ProjectRoot})");
-        Console.WriteLine($"  Model:              {snapshot.Header.Model} ({snapshot.Header.Dimensions} dimensions)");
-        Console.WriteLine($"  Files:              {snapshot.Fingerprints.Count}");
-        Console.WriteLine($"  Chunks:             {snapshot.Chunks.Count}");
-        Console.WriteLine($"  Built at (UTC):     {snapshot.Header.BuiltAtUtc:O}");
-        Console.WriteLine($"  Cache directory:    {cacheDirectory}");
-        Console.WriteLine($"  Cache size on disk: {FormatBytes(cacheSizeBytes)}");
-        Console.WriteLine($"  Refresh time:       {refreshStopwatch.Elapsed.TotalSeconds:F2}s");
-        Console.WriteLine($"  Query time (1 hit): {queryStopwatch.Elapsed.TotalSeconds:F2}s");
-
-        if (result.Warning is not null)
+        foreach (string projectId in registry.ProjectIds)
         {
-            Console.WriteLine($"  Warning:            {result.Warning}");
+            Console.WriteLine($"CodeIndex status: {projectId}");
+
+            string? fault = registry.GetFaultMessage(projectId);
+            if (fault is not null)
+            {
+                Console.WriteLine($"  Error: {fault}");
+                continue;
+            }
+
+            CodeIndexService service = registry.GetService(projectId);
+            ProjectOptions projectOptions = registry.GetProjectOptions(projectId);
+
+            Stopwatch refreshStopwatch = Stopwatch.StartNew();
+            IndexSnapshot snapshot = await service.RefreshAsync();
+            refreshStopwatch.Stop();
+
+            Stopwatch queryStopwatch = Stopwatch.StartNew();
+            SearchResult result = await service.SearchWithStatusAsync(
+                "status check", limit: 1, kind: null, pathFilter: null);
+            queryStopwatch.Stop();
+
+            string cacheDirectory = projectOptions.ResolveCacheDirectory();
+            long cacheSizeBytes = ComputeDirectorySize(cacheDirectory);
+
+            Console.WriteLine($"  Project:            {projectId} ({projectOptions.Root})");
+            Console.WriteLine($"  Model:              {snapshot.Header.Model} ({snapshot.Header.Dimensions} dimensions)");
+            Console.WriteLine($"  Files:              {snapshot.Fingerprints.Count}");
+            Console.WriteLine($"  Chunks:             {snapshot.Chunks.Count}");
+            Console.WriteLine($"  Built at (UTC):     {snapshot.Header.BuiltAtUtc:O}");
+            Console.WriteLine($"  Cache directory:    {cacheDirectory}");
+            Console.WriteLine($"  Cache size on disk: {FormatBytes(cacheSizeBytes)}");
+            Console.WriteLine($"  Refresh time:       {refreshStopwatch.Elapsed.TotalSeconds:F2}s");
+            Console.WriteLine($"  Query time (1 hit): {queryStopwatch.Elapsed.TotalSeconds:F2}s");
+
+            if (result.Warning is not null)
+            {
+                Console.WriteLine($"  Warning:            {result.Warning}");
+            }
         }
     }
 
