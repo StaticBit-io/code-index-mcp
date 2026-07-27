@@ -29,7 +29,7 @@ public sealed record FileFingerprint(string RelativePath, long Length, DateTime 
     /// </summary>
     public static string ComputeHash(string sourceText)
     {
-        string normalised = string.Join('\n', SourceLines.Split(sourceText));
+        string normalised = SourceLines.Join(SourceLines.Split(sourceText));
         byte[] hash = SHA256.HashData(Encoding.UTF8.GetBytes(normalised));
         return Convert.ToHexStringLower(hash);
     }

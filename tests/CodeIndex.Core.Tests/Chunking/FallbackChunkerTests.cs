@@ -1,4 +1,5 @@
 using CodeIndex.Core.Chunking;
+using CodeIndex.Core.Sources;
 using Xunit;
 
 namespace CodeIndex.Core.Tests.Chunking;
@@ -8,7 +9,7 @@ public sealed class FallbackChunkerTests
     [Fact]
     public void Chunk_SplitsByLineWindowsWithOverlap()
     {
-        string source = string.Join('\n', Enumerable.Range(1, 250).Select(i => $"line {i}"));
+        string source = SourceLines.Join(Enumerable.Range(1, 250).Select(i => $"line {i}"));
         FallbackChunker chunker = new(windowLines: 100, overlapLines: 20);
 
         IReadOnlyList<CodeChunk> chunks = chunker.Chunk("weird.cs", source);

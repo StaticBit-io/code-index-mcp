@@ -34,4 +34,10 @@ public static class SourceLines
         int to = Math.Min(lines.Length, endLine);
         return from > to ? string.Empty : string.Join('\n', lines[(from - 1)..to]);
     }
+
+    /// <summary>Joins every line with <c>'\n'</c> — the full-content counterpart to
+    /// <see cref="Join(string[], int, int)"/>'s line range, for callers (fingerprinting, test
+    /// fixtures) that need to recombine an entire <see cref="Split"/> result rather than a
+    /// sub-range.</summary>
+    public static string Join(IEnumerable<string> lines) => string.Join('\n', lines);
 }

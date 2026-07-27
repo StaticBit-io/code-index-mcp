@@ -63,7 +63,7 @@ public sealed class CodeIndexServiceTests : IDisposable
         lines.Add("    }");
         lines.Add("}");
 
-        return (string.Join('\n', lines), lines);
+        return (SourceLines.Join(lines), lines);
     }
 
     private CodeIndexService CreateService(
@@ -110,7 +110,7 @@ public sealed class CodeIndexServiceTests : IDisposable
         int fullLineCount = hit.Chunk.EndLine - hit.Chunk.StartLine + 1;
         Assert.True(fullLineCount > 15, "fixture must produce a chunk longer than the excerpt cap");
 
-        string[] excerptLines = hit.Excerpt.Split('\n');
+        string[] excerptLines = SourceLines.Split(hit.Excerpt);
         Assert.Equal(15, excerptLines.Length);
 
         string[] expectedLines = lines.Skip(hit.Chunk.StartLine - 1).Take(15).ToArray();
@@ -204,7 +204,7 @@ public sealed class CodeIndexServiceTests : IDisposable
 
         Assert.NotNull(hit);
         string[] expectedLines = lines.Skip(chunk.StartLine - 1).Take(fullLineCount).ToArray();
-        Assert.Equal(expectedLines, hit!.Excerpt.Split('\n'));
+        Assert.Equal(expectedLines, SourceLines.Split(hit!.Excerpt));
 
         SearchHit? outOfRange = await service.GetChunkAsync(snapshot.Chunks.Count + 100, TestContext.Current.CancellationToken);
         Assert.Null(outOfRange);
