@@ -14,8 +14,11 @@ namespace CodeIndex.Core.Tests.Architecture;
 /// filesystem. A direct <c>File.ReadAllText</c> or <c>Directory.EnumerateFiles</c> call
 /// compiles and runs perfectly well from anywhere — nothing about the type system stops it —
 /// so a code review is the only other way to catch a regression here, and a review does not
-/// scale over time. Walking every <c>call</c>/<c>callvirt</c> instruction in every method body
-/// and resolving its target type is what catches this reliably.
+/// scale over time. Walking every <c>call</c>/<c>callvirt</c>/<c>newobj</c> instruction in every
+/// method body and resolving its target type is what catches this reliably —
+/// <c>newobj</c> matters as much as the other two: <c>new FileInfo(path).Length</c> never emits
+/// a <c>call</c>/<c>callvirt</c> to anything named <c>File</c>/<c>Directory</c>/<c>FileInfo</c>/
+/// <c>DirectoryInfo</c>, only a <c>newobj</c> for the constructor.
 /// </summary>
 /// <remarks>
 /// Two locations are exempt, both deliberately, both narrow:
@@ -37,6 +40,29 @@ namespace CodeIndex.Core.Tests.Architecture;
 /// </list>
 /// Everywhere else — <c>Chunking</c>, <c>Indexing</c>, <c>Search</c>, <c>Embedding</c> — must
 /// reach project sources exclusively through the <see cref="ISourceProvider"/> injected into it.
+/// <para/>
+/// <b>Deliberately scoped to the <c>CodeIndex.Core</c> assembly only — this does not, and
+/// should not, extend to <c>CodeIndex.Server</c>.</b> The whole reason this rule exists is
+/// stated on <see cref="ISourceProvider"/> itself: it "keeps chunking and indexing testable
+/// against in-memory inputs". That is a property of the <i>business logic</i> — Core is where
+/// <c>InMemorySourceProvider</c> stands in for a real project tree in tests, and where an
+/// untracked direct filesystem call would silently make a unit test not actually be a unit test.
+/// <c>CodeIndex.Server</c> is the composition root and CLI host: process startup, DI wiring,
+/// console output, and (as of this writing) reporting the on-disk size of the cache directory
+/// for the <c>--status</c> path — none of it is chunking or indexing, none of it needs to run
+/// against an in-memory fake, and treating "this process is a CLI that necessarily touches its
+/// own working directory" as a violation would either force an ever-growing pile of
+/// Server-specific exemptions or push legitimate host-level I/O through <c>ISourceProvider</c>,
+/// an abstraction for *project source*, not for the host's own bookkeeping. This was a real
+/// judgement call, not a default: a genuine violation was found in <c>Program.cs</c> (computing
+/// the cache directory's size with raw <c>Directory</c>/<c>FileInfo</c> calls for
+/// <c>--status</c>), and the fix routes that computation through
+/// <see cref="global::CodeIndex.Core.Storage.IndexStore.ComputeCacheSizeBytes"/> — the already-
+/// sanctioned exception above — rather than either leaving Server unscanned-and-violating or
+/// scanning Server and exempting it. Server ends up with *zero* <c>File</c>/<c>Directory</c>/
+/// <c>FileInfo</c>/<c>DirectoryInfo</c> references anywhere in its own code as a result, so if a
+/// future change wants this same IL scan applied to that assembly too, it would start from a
+/// clean slate rather than needing a new exemption carved out for it on day one.
 /// </remarks>
 public sealed class SourceIsolationTests
 {
@@ -63,8 +89,8 @@ public sealed class SourceIsolationTests
 
     /// <summary>
     /// Walks every method body in <paramref name="assemblyPath"/> and returns one
-    /// human-readable description per <c>call</c>/<c>callvirt</c> instruction whose resolved
-    /// target type is one of <see cref="ForbiddenTypeNames"/>, skipping the two exempt
+    /// human-readable description per <c>call</c>/<c>callvirt</c>/<c>newobj</c> instruction whose
+    /// resolved target type is one of <see cref="ForbiddenTypeNames"/>, skipping the two exempt
     /// locations described in the class remarks.
     /// </summary>
     private static List<string> FindForbiddenFileSystemCalls(string assemblyPath)
@@ -186,7 +212,14 @@ public sealed class SourceIsolationTests
             int operandStart = position;
             int operandSize = GetOperandSize(opcode.OperandType, il, position);
 
-            if (opcode == OpCodes.Call || opcode == OpCodes.Callvirt)
+            // newobj (constructing a FileInfo/DirectoryInfo) is exactly as much a filesystem
+            // access as call/callvirt is: "new FileInfo(path).Length" never emits a call to
+            // anything named File/Directory/FileInfo/DirectoryInfo — the constructor invocation
+            // itself is a newobj instruction, invisible to a scan that only looks at call and
+            // callvirt. Resolving its target type uses the exact same MemberReference path as a
+            // call to an instance method: a constructor reference is a MemberReference like any
+            // other, just with a well-known name (".ctor").
+            if (opcode == OpCodes.Call || opcode == OpCodes.Callvirt || opcode == OpCodes.Newobj)
             {
                 int token = BitConverter.ToInt32(il, operandStart);
                 string? forbiddenType = TryResolveForbiddenTargetType(reader, token);

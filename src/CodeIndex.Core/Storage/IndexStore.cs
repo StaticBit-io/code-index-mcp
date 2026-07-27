@@ -171,6 +171,31 @@ public sealed class IndexStore
         DeleteIfExists(VectorsPath + TempSuffix);
     }
 
+    /// <summary>
+    /// Total bytes on disk under the cache directory this store owns (manifest, vectors, and
+    /// any leftover temp files from an interrupted save) — 0 if the directory does not exist.
+    /// Exists so callers that only want to report the cache's on-disk footprint (e.g. the
+    /// server's <c>--status</c> CLI path) go through <see cref="IndexStore"/>, the one
+    /// sanctioned place outside <c>Sources/</c> allowed to touch <see cref="File"/>/
+    /// <see cref="Directory"/> directly (see the class remarks), instead of duplicating that
+    /// exemption at the call site.
+    /// </summary>
+    public long ComputeCacheSizeBytes()
+    {
+        if (!Directory.Exists(_directory))
+        {
+            return 0;
+        }
+
+        long total = 0;
+        foreach (string file in Directory.EnumerateFiles(_directory, "*", SearchOption.AllDirectories))
+        {
+            total += new FileInfo(file).Length;
+        }
+
+        return total;
+    }
+
     private static void DeleteIfExists(string path)
     {
         if (File.Exists(path))

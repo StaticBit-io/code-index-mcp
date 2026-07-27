@@ -185,7 +185,11 @@ public static class Program
             queryStopwatch.Stop();
 
             string cacheDirectory = projectOptions.ResolveCacheDirectory();
-            long cacheSizeBytes = ComputeDirectorySize(cacheDirectory);
+            // Routed through IndexStore (the sanctioned exception to "no direct File/Directory
+            // access outside Sources/" — see SourceIsolationTests) rather than touching
+            // Directory/FileInfo here, so this maintenance-only reporting path does not need its
+            // own exemption from that rule.
+            long cacheSizeBytes = new IndexStore(cacheDirectory).ComputeCacheSizeBytes();
 
             Console.WriteLine($"  Project:            {projectId} ({projectOptions.Root})");
             Console.WriteLine($"  Model:              {snapshot.Header.Model} ({snapshot.Header.Dimensions} dimensions)");
@@ -202,22 +206,6 @@ public static class Program
                 Console.WriteLine($"  Warning:            {result.Warning}");
             }
         }
-    }
-
-    private static long ComputeDirectorySize(string directory)
-    {
-        if (!Directory.Exists(directory))
-        {
-            return 0;
-        }
-
-        long total = 0;
-        foreach (string file in Directory.EnumerateFiles(directory, "*", SearchOption.AllDirectories))
-        {
-            total += new FileInfo(file).Length;
-        }
-
-        return total;
     }
 
     private static string FormatBytes(long bytes)

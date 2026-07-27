@@ -510,4 +510,35 @@ public sealed class IndexStoreTests : IDisposable
 
         Assert.Contains("hash", error.Message, StringComparison.OrdinalIgnoreCase);
     }
+
+    [Fact]
+    public void ComputeCacheSizeBytes_ReturnsZero_WhenCacheDirectoryNeverExisted()
+    {
+        IndexStore store = new(_dir);
+
+        Assert.Equal(0, store.ComputeCacheSizeBytes());
+    }
+
+    [Fact]
+    public async Task ComputeCacheSizeBytes_SumsManifestAndVectorsFileSizes()
+    {
+        IndexStore store = new(_dir);
+        await store.SaveAsync(BuildSnapshot(), TestContext.Current.CancellationToken);
+
+        long expected = new FileInfo(store.ManifestPath).Length + new FileInfo(store.VectorsPath).Length;
+
+        Assert.Equal(expected, store.ComputeCacheSizeBytes());
+    }
+
+    [Fact]
+    public async Task ComputeCacheSizeBytes_IncludesLeftoverTempFilesFromAnInterruptedSave()
+    {
+        IndexStore store = new(_dir);
+        await store.SaveAsync(BuildSnapshot(), TestContext.Current.CancellationToken);
+        long beforeTempFile = store.ComputeCacheSizeBytes();
+
+        File.WriteAllBytes(store.VectorsPath + ".tmp", [1, 2, 3, 4, 5]);
+
+        Assert.Equal(beforeTempFile + 5, store.ComputeCacheSizeBytes());
+    }
 }
