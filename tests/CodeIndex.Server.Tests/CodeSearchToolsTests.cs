@@ -546,6 +546,36 @@ public sealed partial class CodeSearchToolsTests : IDisposable
         Assert.Contains("unavailable", errorElement.GetString(), StringComparison.OrdinalIgnoreCase);
     }
 
+    [Fact]
+    public async Task CodeSearch_WithProject_BlankQuery_ReturnsReadableErrorRatherThanThrowing()
+    {
+        WriteFile("src/A.cs", MakeSimpleFile("Acme.A", "Widget", "DoA"));
+        CodeSearchTools tools = CreateTools(new StubEmbeddingClient());
+
+        string json = await tools.SearchAsync(
+            "   ", limit: 10, kind: null, path_filter: null, project: DefaultProjectId, TestContext.Current.CancellationToken);
+
+        using JsonDocument document = JsonDocument.Parse(json);
+        Assert.True(document.RootElement.TryGetProperty("error", out JsonElement errorElement));
+        Assert.Contains("blank", errorElement.GetString(), StringComparison.OrdinalIgnoreCase);
+    }
+
+    [Fact]
+    public async Task CodeSearch_HitPayload_CarriesAScoreField()
+    {
+        WriteFile("src/A.cs", MakeSimpleFile("Acme.A", "Widget", "DoSomething"));
+        CodeSearchTools tools = CreateTools(new StubEmbeddingClient());
+
+        string wrapped = await tools.SearchAsync(
+            "DoSomething", limit: 10, kind: null, path_filter: null, project: null, TestContext.Current.CancellationToken);
+        string json = StripUntrustedContentMarkers(wrapped);
+
+        using JsonDocument document = JsonDocument.Parse(json);
+        JsonElement firstHit = document.RootElement.GetProperty("hits")[0];
+        Assert.True(firstHit.TryGetProperty("score", out JsonElement scoreElement));
+        Assert.True(scoreElement.GetDouble() > 0);
+    }
+
     // --- Multi-project tests -------------------------------------------------------------
 
     [Fact]

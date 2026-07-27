@@ -135,16 +135,27 @@ find where something is *implemented*, not to find every literal occurrence of a
 
 | Parameter | Type | Default | Description |
 |---|---|---|---|
-| `query` | string | — | Natural-language question or exact identifier/symbol name. |
-| `limit` | int | `10` | Maximum number of hits to return. |
+| `query` | string | — | Natural-language question or exact identifier/symbol name. Blank/whitespace-only is rejected with an error rather than returning arbitrary hits. |
+| `limit` | int | `10` | Maximum number of hits to return. Negative is rejected with an error; `0` returns none. Not silently capped — a large limit searches deeper into both branches to try to satisfy it. |
 | `kind` | string? | `null` | Restrict to one chunk kind: `Class`, `Interface`, `Struct`, `Record`, `Enum`, `Method`, `Constructor`, `Property`, `Field`, or `FileFragment`. Case-insensitive; an unrecognized value is ignored silently. |
 | `path_filter` | string? | `null` | Case-insensitive substring filter on the file's relative path. |
 | `project` | string? | `null` | Restrict the search to one configured project's `Id`. Omit to search every configured project and merge the results. |
 
 Returns a ranked list of hits, each with an `id`, the `project` it came from, file path, line
-range, kind, symbol, signature, doc comment (if any), and a short excerpt. The index refreshes
-incrementally before every call. An unrecognized `project` value returns a clear error listing the
-configured project ids, rather than an empty result.
+range, kind, symbol, signature, doc comment (if any), a short excerpt, and a `score`: the fused
+Reciprocal-Rank-Fusion value (not a raw similarity percentage — see
+[Searching across projects](#searching-across-projects) for what feeds it). Higher is better; a
+hit near the bottom of only one branch's ranking is a weak match worth a second look. The vector
+branch also applies a relevance floor before fusion — see
+[Search quality: the query instruction prefix](#search-quality-the-query-instruction-prefix) and
+`Embedding:MinCosineSimilarity` below — so a query with no genuine semantic match in the index
+does not come back with confident-looking noise. The index refreshes incrementally before every
+call. An unrecognized `project` value returns a clear error listing the configured project ids,
+rather than an empty result. If a source file changed since the last successful refresh and the
+embedding backend is unreachable, `code_search` still returns symbol-branch results from the last
+known-good snapshot — including one loaded from disk on the very first call of a freshly started
+process, before this server instance has ever refreshed anything itself — with `warning` explaining
+that the index is stale (see [Known limitations](#known-limitations)).
 
 ### `code_get_chunk`
 
