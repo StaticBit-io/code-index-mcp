@@ -70,13 +70,11 @@ public sealed class CodeSearchTools
         "normal search, and slower still when rebuilding every project.";
 
     // System.Text.Json's default encoder rewrites '<', '>' and '&' inside string values as
-    // numeric Unicode escapes. That both mangles ordinary C# generics in every excerpt (an
-    // angle-bracket type no longer reads as source code) and, more importantly for this
-    // file, means a closing untrusted-content marker embedded in indexed source would
-    // never survive serialization as a literal substring — silently bypassing the defusing
-    // in UntrustedContent.Wrap, which would have nothing left to find and replace. Relaxed
-    // escaping keeps source code readable and makes the marker-defusing the actual,
-    // exercised line of defense.
+    // numeric Unicode escapes, which would mangle ordinary C# generics in every excerpt (an
+    // angle-bracket type no longer reads as source code). Relaxed escaping keeps source code
+    // readable; this is safe against marker forgery because UntrustedContent.Wrap no longer
+    // depends on the content being free of marker-shaped substrings — the per-call random
+    // nonce in each marker is what indexed source cannot forge, not escaping or defusing.
     private static readonly JsonSerializerOptions SerializerOptions = new()
     {
         PropertyNamingPolicy = JsonNamingPolicy.SnakeCaseLower,

@@ -349,14 +349,27 @@ need to change.
 ## Untrusted content
 
 Every source fragment `code_search` and `code_get_chunk` return is wrapped in
-`<untrusted-content origin="...">...</untrusted-content>` markers. The indexed project's source
-is still, ultimately, third-party text as far as the agent reading it is concerned — a comment or
-string literal inside it could contain text crafted to look like an instruction ("ignore previous
-instructions and...") aimed at whatever agent later reads the search result. The markers tell a
-downstream agent that follows the standard `untrusted-content` convention to treat everything
-between them as data to read, never as instructions to follow, regardless of what it appears to
-say. Any literal closing-tag substring inside the indexed content is defused (a zero-width space
-is inserted) so indexed source can never forge its own closing marker and escape the wrapper.
+`<untrusted-content id="{nonce}" origin="...">...</untrusted-content id="{nonce}">` markers, where
+`{nonce}` is a fresh, cryptographically random value generated for that call. The indexed
+project's source is still, ultimately, third-party text as far as the agent reading it is
+concerned — a comment or string literal inside it could contain text crafted to look like an
+instruction ("ignore previous instructions and...") aimed at whatever agent later reads the search
+result. The markers tell a downstream agent that follows the standard `untrusted-content`
+convention to treat everything between them as data to read, never as instructions to follow,
+regardless of what it appears to say.
+
+An earlier version of this wrapper used a fixed marker string and tried to "defuse" any literal
+closing-tag substring already inside the indexed content (inserting a zero-width space) so that
+indexed source could supposedly never forge its own closing marker. **That guarantee did not
+hold**: a single exact, case-sensitive string replace missed a closing tag with an extra space
+before `>` (still valid, spec-compliant XML), a different letter case, and — worst of all — the
+literal defused form itself, since a zero-width space is invisible and so the "defused" and
+genuine markers were visually identical text an attacker could simply write directly. The opening
+marker was not defused at all, so forging an apparent exit from untrusted context was also
+possible. The fix was not a better defuse routine; it was removing the need for one. Because the
+nonce is drawn fresh per call and indexed content has no way to predict it, nothing embedded in
+that content can ever equal the current call's `id="{nonce}"`, so it cannot close (or fake-open)
+the wrapper regardless of case, spacing, or hidden Unicode tricks.
 
 ## Known limitations
 
