@@ -68,9 +68,10 @@ public static class Program
         builder.Services.AddSingleton(serviceProvider =>
         {
             CodeIndexOptions options = serviceProvider.GetRequiredService<IOptions<CodeIndexOptions>>().Value;
+            EmbeddingOptions embeddingOptions = serviceProvider.GetRequiredService<IOptions<EmbeddingOptions>>().Value;
             ChunkerPipeline chunkerPipeline = serviceProvider.GetRequiredService<ChunkerPipeline>();
             IEmbeddingClient embeddingClient = serviceProvider.GetRequiredService<IEmbeddingClient>();
-            return new ProjectRegistry(options, chunkerPipeline, embeddingClient);
+            return new ProjectRegistry(options, chunkerPipeline, embeddingClient, embeddingOptions);
         });
 
         builder.Services
@@ -93,6 +94,26 @@ public static class Program
         if (args.Contains("--status", StringComparer.OrdinalIgnoreCase))
         {
             return await RunGuardedAsync(() => RunStatusAsync(host.Services));
+        }
+
+        // ProjectRegistry is a lazily-resolved DI singleton: left alone, a configuration error in
+        // its constructor (e.g. two projects sharing an Id — see CodeIndexOptions.Validate) would
+        // not surface until the MCP SDK resolves it for the first tool call, deep inside a stdio
+        // request/response cycle where the only thing an agent (or a human) ever sees is the SDK's
+        // generic "An error occurred invoking '<tool>'." — the specific, actionable message this
+        // throws with is lost. Forcing resolution here, before host.RunAsync() ever starts the
+        // stdio transport, turns that into exactly what the README promises: the server refuses to
+        // start, naming the problem, with a non-zero exit code — the same contract --build-only and
+        // --status already get via RunGuardedAsync, applied to the one remaining path that serves
+        // requests instead of running a one-shot maintenance action.
+        try
+        {
+            host.Services.GetRequiredService<ProjectRegistry>();
+        }
+        catch (Exception ex)
+        {
+            Console.Error.WriteLine($"Error: {ex.Message}");
+            return 1;
         }
 
         await host.RunAsync();
