@@ -383,6 +383,158 @@ public sealed class CodeIndexServiceTests : IDisposable
         Assert.Empty(result.Hits);
     }
 
+    [Fact]
+    public async Task SearchWithStatusAsync_NegativeLimit_ThrowsArgumentException()
+    {
+        InMemorySourceProvider source = new(new Dictionary<string, string>
+        {
+            ["src/A.cs"] = MakeSimpleFile("Acme.A", "Widget", "DoA"),
+        });
+        CodeIndexService service = CreateService(source, new StubEmbeddingClient(), out _);
+
+        await Assert.ThrowsAsync<ArgumentException>(() => service.SearchWithStatusAsync(
+            "DoA", limit: -1, kind: null, pathFilter: null, TestContext.Current.CancellationToken));
+    }
+
+    [Theory]
+    [InlineData("")]
+    [InlineData("   ")]
+    [InlineData("\t\n")]
+    public async Task SearchWithStatusAsync_BlankQuery_ThrowsArgumentExceptionRatherThanReturningArbitraryHits(string blankQuery)
+    {
+        InMemorySourceProvider source = new(new Dictionary<string, string>
+        {
+            ["src/A.cs"] = MakeSimpleFile("Acme.A", "Widget", "DoA"),
+        });
+        CodeIndexService service = CreateService(source, new StubEmbeddingClient(), out _);
+
+        await Assert.ThrowsAsync<ArgumentException>(() => service.SearchWithStatusAsync(
+            blankQuery, limit: 5, kind: null, pathFilter: null, TestContext.Current.CancellationToken));
+    }
+
+    [Fact]
+    public async Task SearchWithStatusAsync_FreshServiceSeedsFromDisk_SoAFailingFirstRefreshStillReturnsSymbolHits()
+    {
+        InMemorySourceProvider source = new(new Dictionary<string, string>
+        {
+            ["src/A.cs"] = MakeSimpleFile("Acme.A", "Widget", "DoA"),
+        });
+
+        // Simulate a previous, separate process run: build the index successfully with a working
+        // embedder, then discard that CodeIndexService instance entirely — only the on-disk store
+        // (under `store`'s directory) survives, exactly like an MCP client's next session starting
+        // a brand-new server process against an already-populated cache.
+        CodeIndexService priorProcess = CreateService(source, new StubEmbeddingClient(), out IndexStore store);
+        await priorProcess.RefreshAsync(TestContext.Current.CancellationToken);
+
+        // A file changes after that last successful build, so the next refresh needs to re-embed
+        // something — and a brand-new CodeIndexService is constructed against the same on-disk
+        // store with an embedder that has never worked in this "process" at all (Ollama was never
+        // reachable this session).
+        source.Set("src/A.cs", MakeSimpleFile("Acme.A", "Widget", "DoARenamed"));
+        ChunkerPipeline pipeline = new(new RoslynChunker(), new FallbackChunker());
+        SwitchableEmbeddingClient deadEmbedder = new() { ShouldThrow = true };
+        IndexBuilder freshBuilder = new(source, pipeline, deadEmbedder, store, Options.Create(new CodeIndexOptions()));
+        CodeIndexService freshService = new(freshBuilder, source, deadEmbedder);
+
+        // Confirms this is genuinely the "nothing loaded yet" state the fix targets, not an
+        // instance that happens to already hold a snapshot some other way.
+        Assert.Null(freshService.Current);
+
+        SearchResult result = await freshService.SearchWithStatusAsync(
+            "DoA", limit: 5, kind: null, pathFilter: null, TestContext.Current.CancellationToken);
+
+        // Must not throw, and must find the OLD (pre-edit, on-disk) symbol via the symbol branch —
+        // proving the on-disk snapshot was loaded and used instead of the call failing outright
+        // just because this instance's own in-memory history is empty.
+        Assert.NotEmpty(result.Hits);
+        Assert.Contains(result.Hits, h => h.Chunk.Symbol == "Acme.A.Widget.DoA");
+        Assert.True(result.EmbeddingsUnavailable);
+        Assert.NotNull(result.Warning);
+        Assert.Contains("stale", result.Warning, StringComparison.OrdinalIgnoreCase);
+    }
+
+    [Fact]
+    public async Task GetChunkAsync_FreshServiceSeedsFromDisk_SoAFailingFirstRefreshStillReturnsTheChunk()
+    {
+        InMemorySourceProvider source = new(new Dictionary<string, string>
+        {
+            ["src/A.cs"] = MakeSimpleFile("Acme.A", "Widget", "DoA"),
+        });
+
+        CodeIndexService priorProcess = CreateService(source, new StubEmbeddingClient(), out IndexStore store);
+        IndexSnapshot original = await priorProcess.RefreshAsync(TestContext.Current.CancellationToken);
+        int methodChunkId = Array.FindIndex(original.Chunks.ToArray(), c => c.Kind == ChunkKind.Method);
+        Assert.True(methodChunkId >= 0);
+
+        source.Set("src/A.cs", MakeSimpleFile("Acme.A", "Widget", "DoARenamed"));
+        ChunkerPipeline pipeline = new(new RoslynChunker(), new FallbackChunker());
+        SwitchableEmbeddingClient deadEmbedder = new() { ShouldThrow = true };
+        IndexBuilder freshBuilder = new(source, pipeline, deadEmbedder, store, Options.Create(new CodeIndexOptions()));
+        CodeIndexService freshService = new(freshBuilder, source, deadEmbedder);
+
+        Assert.Null(freshService.Current);
+
+        SearchHit? hit = await freshService.GetChunkAsync(methodChunkId, TestContext.Current.CancellationToken);
+
+        Assert.NotNull(hit);
+        Assert.Equal("Acme.A.Widget.DoA", hit!.Chunk.Symbol);
+    }
+
+    [Fact]
+    public async Task SearchWithStatusAsync_RelevanceFloor_ExcludesAWeakVectorMatchButKeepsAStrongOne()
+    {
+        InMemorySourceProvider source = new(new Dictionary<string, string>
+        {
+            // "Alpha" carries the marker that makes MarkerBasedEmbeddingClient embed it aligned
+            // with every query (cosine 1.0); "Beta" carries the marker that makes it embed
+            // orthogonally (cosine 0.0). Neither method name contains the query term itself, so
+            // the symbol branch cannot find either of them — whatever shows up came purely from
+            // the vector branch, isolating exactly what the floor is supposed to filter.
+            ["src/Alpha.cs"] = MakeSimpleFile("Acme.Alpha", "Widget", MarkerBasedEmbeddingClient.RealHitMarker),
+            ["src/Beta.cs"] = MakeSimpleFile("Acme.Beta", "Gadget", MarkerBasedEmbeddingClient.UnrelatedHitMarker),
+        });
+
+        MarkerBasedEmbeddingClient embedder = new();
+        IndexStore store = new(_dir);
+        ChunkerPipeline pipeline = new(new RoslynChunker(), new FallbackChunker());
+        IndexBuilder builder = new(source, pipeline, embedder, store, Options.Create(new CodeIndexOptions()));
+
+        // A floor of 0.5 sits strictly between the two markers' cosine similarities (1.0 and 0.0),
+        // so it must keep the aligned hit and drop the orthogonal one.
+        CodeIndexService service = new(builder, source, embedder, minCosineSimilarity: 0.5);
+
+        SearchResult result = await service.SearchWithStatusAsync(
+            "does not matter — MarkerBasedEmbeddingClient ignores query text",
+            limit: 10, kind: null, pathFilter: null, TestContext.Current.CancellationToken);
+
+        Assert.Contains(result.Hits, h => h.Chunk.FilePath == "src/Alpha.cs");
+        Assert.DoesNotContain(result.Hits, h => h.Chunk.FilePath == "src/Beta.cs");
+    }
+
+    [Fact]
+    public async Task SearchWithStatusAsync_NoRelevanceFloor_TheOtherwiseExcludedWeakMatchComesBackThrough()
+    {
+        // Same fixture and embedder as the test above, but with no floor configured (the test
+        // default — see CodeIndexService's constructor remarks) — control case proving the
+        // exclusion above is actually caused by the floor, not by some other filtering.
+        InMemorySourceProvider source = new(new Dictionary<string, string>
+        {
+            ["src/Alpha.cs"] = MakeSimpleFile("Acme.Alpha", "Widget", MarkerBasedEmbeddingClient.RealHitMarker),
+            ["src/Beta.cs"] = MakeSimpleFile("Acme.Beta", "Gadget", MarkerBasedEmbeddingClient.UnrelatedHitMarker),
+        });
+
+        MarkerBasedEmbeddingClient embedder = new();
+        CodeIndexService service = CreateService(source, embedder, out _);
+
+        SearchResult result = await service.SearchWithStatusAsync(
+            "does not matter — MarkerBasedEmbeddingClient ignores query text",
+            limit: 10, kind: null, pathFilter: null, TestContext.Current.CancellationToken);
+
+        Assert.Contains(result.Hits, h => h.Chunk.FilePath == "src/Alpha.cs");
+        Assert.Contains(result.Hits, h => h.Chunk.FilePath == "src/Beta.cs");
+    }
+
     /// <summary>Behaves exactly like <see cref="StubEmbeddingClient"/> until toggled, then
     /// throws <see cref="EmbeddingUnavailableException"/> on every call — lets a test simulate
     /// Ollama going down *after* the index was already built with working embeddings.</summary>

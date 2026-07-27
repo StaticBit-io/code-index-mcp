@@ -269,6 +269,43 @@ public sealed class IndexBuilder
     }
 
     /// <summary>
+    /// Loads the on-disk snapshot verbatim, performing none of <see cref="RefreshAsync"/>'s
+    /// change-detection or rebuild logic — a cheap "peek" used by <see
+    /// cref="Search.CodeIndexService"/> to seed its in-memory cache the first time a project is
+    /// touched in a process, so that if the very next real refresh fails (most commonly: a
+    /// changed file needs re-embedding and the embedding backend is down), there is already a
+    /// last-known-good snapshot to fall back to instead of losing a perfectly valid on-disk index
+    /// that was never given a chance to be used — see the remarks on <see
+    /// cref="Search.CodeIndexService.RefreshOrFallBackAsync"/>.
+    /// </summary>
+    /// <returns>
+    /// The stored snapshot, or <see langword="null"/> when no index has ever been saved, the
+    /// saved index is corrupted, or it was built with a different embedding model/dimensionality
+    /// than this instance is configured for. In every one of those cases there is nothing safe to
+    /// seed with; recovery (rebuilding, or deleting a corrupted cache) is <see
+    /// cref="RefreshAsync"/>'s job, not this method's — this method never writes anything.
+    /// </returns>
+    public async Task<IndexSnapshot?> TryLoadStoredSnapshotAsync(CancellationToken cancellationToken = default)
+    {
+        IndexSnapshot? stored;
+        try
+        {
+            stored = await _indexStore.LoadAsync(cancellationToken).ConfigureAwait(false);
+        }
+        catch (IndexCorruptedException)
+        {
+            return null;
+        }
+
+        if (stored is null || !stored.Header.IsCompatibleWith(_embeddingClient.Model, _embeddingClient.Dimensions))
+        {
+            return null;
+        }
+
+        return stored;
+    }
+
+    /// <summary>
     /// Cheap "does anything need looking at" pass: only <see cref="ISourceProvider.StatAsync"/>
     /// (never <see cref="ISourceProvider.ReadTextAsync"/>) and no vector work at all. Returns as
     /// soon as it finds one reason to do real work — an added, removed, or stat-mismatched file —

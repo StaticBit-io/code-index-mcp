@@ -44,12 +44,13 @@ public sealed record SearchResult(IReadOnlyList<SearchHit> Hits, bool Embeddings
 /// <see cref="ChunkKind"/> and the path substring are applied first, in
 /// <see cref="BuildCandidateIndices"/>, to produce a candidate set of chunk ordinals; <see
 /// cref="VectorSearcher"/> and <see cref="SymbolMatcher"/> then only ever see that subset, so
-/// their branch-depth cutoff (<see cref="BranchDepth"/>) is spent entirely on chunks that could
-/// actually be returned. The alternative — running both branches unfiltered and only filtering
-/// their top-<see cref="BranchDepth"/> output — would silently distort results whenever a filter
-/// is narrow: a <c>pathFilter</c> matching only a handful of rare files could come back empty
-/// even though matching chunks exist deeper in the unfiltered ranking, simply because none of
-/// them made it into either branch's top 50 before filtering ever ran.
+/// their branch-depth cutoff (at least <see cref="MinBranchDepth"/>, more if the caller's
+/// <c>limit</c> asks for more — see <see cref="SearchWithStatusAsync"/>) is spent entirely on
+/// chunks that could actually be returned. The alternative — running both branches unfiltered and
+/// only filtering their top-ranked output — would silently distort results whenever a filter is
+/// narrow: a <c>pathFilter</c> matching only a handful of rare files could come back empty even
+/// though matching chunks exist deeper in the unfiltered ranking, simply because none of them made
+/// it into either branch's cutoff before filtering ever ran.
 /// </para>
 /// <para>
 /// The cost of filtering first is that a filtered query pays for a fresh, candidate-sized copy of
@@ -67,8 +68,13 @@ public sealed record SearchResult(IReadOnlyList<SearchHit> Hits, bool Embeddings
 /// </remarks>
 public sealed class CodeIndexService
 {
-    /// <summary>How many hits each branch (vector, symbol) contributes before fusion.</summary>
-    private const int BranchDepth = 50;
+    /// <summary>The minimum number of hits each branch (vector, symbol) contributes before
+    /// fusion, regardless of the caller's requested <c>limit</c>. A small requested limit must
+    /// not starve fusion quality: a chunk ranked #40 in the vector branch but #2 in the symbol
+    /// branch can only combine into a strong fused result if both branches were searched at
+    /// least this deep. See <see cref="SearchWithStatusAsync"/> for how the effective depth for
+    /// a given call is derived from this floor and the caller's <c>limit</c>.</summary>
+    private const int MinBranchDepth = 50;
 
     /// <summary>Excerpts shown to callers are capped at this many lines.</summary>
     private const int MaxExcerptLines = 15;
@@ -76,6 +82,7 @@ public sealed class CodeIndexService
     private readonly IndexBuilder _builder;
     private readonly ISourceProvider _source;
     private readonly IEmbeddingClient _embedder;
+    private readonly float _minCosineSimilarity;
 
     /// <summary>Serialises every refresh/rebuild so concurrent tool calls never race each other
     /// into rebuilding the on-disk store at the same time.</summary>
@@ -83,11 +90,31 @@ public sealed class CodeIndexService
 
     private IndexSnapshot? _current;
 
-    public CodeIndexService(IndexBuilder builder, ISourceProvider source, IEmbeddingClient embedder)
+    /// <param name="builder">Builds/refreshes the on-disk index this service searches.</param>
+    /// <param name="source">Reads chunk excerpts/bodies on demand at query time.</param>
+    /// <param name="embedder">Embeds search queries for the vector branch.</param>
+    /// <param name="minCosineSimilarity">
+    /// Relevance floor for the vector branch — see <see cref="EmbeddingOptions.MinCosineSimilarity"/>
+    /// for how the project's real default (<see cref="EmbeddingOptions.DefaultMinCosineSimilarity"/>)
+    /// was measured and what it is for. Defaults here to <see cref="double.NegativeInfinity"/> —
+    /// "no floor," matching <see cref="VectorSearcher.Search"/>'s own default — deliberately not to
+    /// the project's real default: most callers that construct this class directly (nearly every
+    /// test in this codebase) are stand-ins that embed with no real semantic signal at all (see
+    /// e.g. the stub embedding clients' own remarks), and a floor tuned for a real embedding
+    /// model's score distribution is meaningless — worse, actively misleading — applied to those.
+    /// <see cref="ProjectRegistry"/> is what wires the real, measured default through from
+    /// configuration for the one path that actually talks to a real embedding backend.
+    /// </param>
+    public CodeIndexService(
+        IndexBuilder builder,
+        ISourceProvider source,
+        IEmbeddingClient embedder,
+        double minCosineSimilarity = double.NegativeInfinity)
     {
         _builder = builder;
         _source = source;
         _embedder = embedder;
+        _minCosineSimilarity = (float)minCosineSimilarity;
     }
 
     /// <summary>The most recently loaded/built snapshot, or <c>null</c> before the first refresh.</summary>
@@ -149,13 +176,39 @@ public sealed class CodeIndexService
     /// requires *a* snapshot to search, not necessarily the newest one.
     /// </summary>
     /// <remarks>
-    /// Only rethrows when there is no prior snapshot to fall back to (<see cref="_current"/> is
-    /// still <c>null</c> — nothing has ever been built successfully): with nothing indexed at
-    /// all, there is nothing left to degrade to, so the failure is genuinely fatal and callers
-    /// need to see it rather than silently get an empty result.
+    /// <para>
+    /// <b>The fallback snapshot can come from disk, not just from this instance's own history.</b>
+    /// An MCP client starts a fresh server process per session, so <see cref="_current"/> is
+    /// <c>null</c> on the very first call regardless of whether a working index already sits on
+    /// disk from a previous run. Without seeding, that first call's failure would have nothing to
+    /// fall back to and would rethrow even though a perfectly usable snapshot exists — silently
+    /// contradicting the premise that this method degrades instead of failing. <see
+    /// cref="SeedFromStoreIfEmptyAsync"/> closes that gap: when <see cref="_current"/> is still
+    /// <c>null</c>, it loads the on-disk snapshot (if any) into <see cref="_current"/> *before*
+    /// attempting the real refresh below, so a refresh that fails immediately still has that
+    /// loaded snapshot to fall back to. This costs nothing extra on the common path: <see
+    /// cref="RefreshAsync"/> passes <see cref="_current"/> into <see
+    /// cref="IndexBuilder.RefreshAsync"/> as its <c>current</c> parameter, so once seeded, the
+    /// refresh itself never re-reads the manifest/vector files from disk — the same single load
+    /// that would otherwise have happened inside a failed <see cref="IndexBuilder.RefreshAsync"/>
+    /// call (and been thrown away with it) now happens once, up front, and survives the failure.
+    /// </para>
+    /// <para>
+    /// Only rethrows when there is no snapshot to fall back to at all — neither one this instance
+    /// already holds, nor one sitting on disk from a previous process (<see
+    /// cref="SeedFromStoreIfEmptyAsync"/> found nothing, or the on-disk one is corrupted /
+    /// incompatible with the current embedding model): with nothing indexed anywhere, there is
+    /// nothing left to degrade to, so the failure is genuinely fatal and callers need to see it
+    /// rather than silently get an empty result.
+    /// </para>
     /// </remarks>
     private async Task<RefreshOutcome> RefreshOrFallBackAsync(CancellationToken cancellationToken)
     {
+        if (_current is null)
+        {
+            await SeedFromStoreIfEmptyAsync(cancellationToken).ConfigureAwait(false);
+        }
+
         try
         {
             IndexSnapshot snapshot = await RefreshAsync(cancellationToken).ConfigureAwait(false);
@@ -170,6 +223,29 @@ public sealed class CodeIndexService
             }
 
             return new RefreshOutcome(lastKnownGood, IndexStale: true, StaleWarning: StaleIndexMessage(ex));
+        }
+    }
+
+    /// <summary>
+    /// Seeds <see cref="_current"/> from the on-disk store when this instance has never held a
+    /// snapshot in memory — see the remarks on <see cref="RefreshOrFallBackAsync"/> for why this
+    /// exists. Re-checks <see cref="_current"/> under <see cref="_gate"/> (not just before
+    /// calling this method) so two overlapping first calls never both load the store: whichever
+    /// wins the gate seeds it, and the other sees it already populated and does nothing. A no-op
+    /// (nothing on disk, or what's there is corrupted/incompatible) leaves <see cref="_current"/>
+    /// exactly as it was — still <c>null</c> — so the subsequent real refresh behaves exactly as
+    /// it did before this method existed.
+    /// </summary>
+    private async Task SeedFromStoreIfEmptyAsync(CancellationToken cancellationToken)
+    {
+        await _gate.WaitAsync(cancellationToken).ConfigureAwait(false);
+        try
+        {
+            _current ??= await _builder.TryLoadStoredSnapshotAsync(cancellationToken).ConfigureAwait(false);
+        }
+        finally
+        {
+            _gate.Release();
         }
     }
 
@@ -228,20 +304,48 @@ public sealed class CodeIndexService
     /// method returning useful matches, not an exception, unless the index has never been built at
     /// all (see <see cref="RefreshOrFallBackAsync"/>).
     /// </summary>
+    /// <exception cref="ArgumentException"><paramref name="query"/> is blank, or <paramref
+    /// name="limit"/> is negative — see the parameter checks at the top of this method for the
+    /// exact messages. Checked before the (possibly expensive) refresh runs, so an invalid call
+    /// never pays for one.</exception>
     public async Task<SearchResult> SearchWithStatusAsync(
         string query, int limit, ChunkKind? kind, string? pathFilter, CancellationToken cancellationToken = default)
     {
+        if (string.IsNullOrWhiteSpace(query))
+        {
+            // The symbol branch already treats a blank query as "matches nothing" (see
+            // SymbolMatcher.Match), but the vector branch has no equivalent guard: it would
+            // happily embed the bare instruction-prefix text and return whatever the embedding
+            // backend considers closest to it — fifty confident-looking, entirely meaningless
+            // hits. Rejecting outright here is cheaper (no refresh, no embedding call) and more
+            // honest than letting either branch improvise an answer to a query that is not one.
+            throw new ArgumentException("Query must not be blank.", nameof(query));
+        }
+
+        if (limit < 0)
+        {
+            // limit == 0 is a legitimate "give me nothing" call (handled below, after the
+            // refresh, so its staleness warning is still reported); only negative is nonsensical.
+            throw new ArgumentException($"{nameof(limit)} must not be negative, was {limit}.", nameof(limit));
+        }
+
         RefreshOutcome refreshed = await RefreshOrFallBackAsync(cancellationToken).ConfigureAwait(false);
         IndexSnapshot snapshot = refreshed.Snapshot;
 
-        if (limit <= 0)
+        if (limit == 0)
         {
             return new SearchResult([], refreshed.IndexStale, refreshed.StaleWarning);
         }
 
+        // Each branch must be searched at least MinBranchDepth deep regardless of how small
+        // `limit` is (see MinBranchDepth), but a caller asking for more final results than that
+        // must not be silently capped at it — see the class remarks on BuildCandidateIndices for
+        // the same "don't silently distort results" principle applied to filtering.
+        int branchDepth = Math.Max(MinBranchDepth, limit);
+
         List<int>? candidateIndices = BuildCandidateIndices(snapshot, kind, pathFilter);
 
-        IReadOnlyList<ScoredIndex> symbolHits = RunSymbolBranch(snapshot, candidateIndices, query);
+        IReadOnlyList<ScoredIndex> symbolHits = RunSymbolBranch(snapshot, candidateIndices, query, branchDepth);
 
         bool embeddingsUnavailable = refreshed.IndexStale;
         string? warning = refreshed.StaleWarning;
@@ -249,7 +353,7 @@ public sealed class CodeIndexService
 
         try
         {
-            vectorHits = await RunVectorBranchAsync(snapshot, candidateIndices, query, cancellationToken)
+            vectorHits = await RunVectorBranchAsync(snapshot, candidateIndices, query, branchDepth, cancellationToken)
                 .ConfigureAwait(false);
         }
         catch (EmbeddingUnavailableException ex)
@@ -353,11 +457,11 @@ public sealed class CodeIndexService
     }
 
     private static IReadOnlyList<ScoredIndex> RunSymbolBranch(
-        IndexSnapshot snapshot, List<int>? candidateIndices, string query)
+        IndexSnapshot snapshot, List<int>? candidateIndices, string query, int branchDepth)
     {
         if (candidateIndices is null)
         {
-            return new SymbolMatcher(snapshot.Chunks).Match(query, BranchDepth);
+            return new SymbolMatcher(snapshot.Chunks).Match(query, branchDepth);
         }
 
         List<CodeChunk> filteredChunks = new(candidateIndices.Count);
@@ -366,12 +470,22 @@ public sealed class CodeIndexService
             filteredChunks.Add(snapshot.Chunks[index]);
         }
 
-        IReadOnlyList<ScoredIndex> localHits = new SymbolMatcher(filteredChunks).Match(query, BranchDepth);
+        IReadOnlyList<ScoredIndex> localHits = new SymbolMatcher(filteredChunks).Match(query, branchDepth);
         return RemapToOriginalIndices(localHits, candidateIndices);
     }
 
+    /// <summary>
+    /// Runs the vector branch and drops any candidate whose cosine similarity falls below <see
+    /// cref="_minCosineSimilarity"/> — the relevance floor — before <paramref name="branchDepth"/>
+    /// selection ever sees it (see <see cref="VectorSearcher.Search"/>'s <c>minScore</c>
+    /// parameter). Without this floor, an unrelated project's best (but still weak) match, or a
+    /// nonsense query's best (but still meaningless) match, would receive "its own rank 1" and
+    /// score identically under Reciprocal Rank Fusion to a genuine top match elsewhere — RRF's
+    /// score depends only on rank, never on how similar the match actually was. See <see
+    /// cref="EmbeddingOptions.MinCosineSimilarity"/> for how the default threshold was measured.
+    /// </summary>
     private async Task<IReadOnlyList<ScoredIndex>> RunVectorBranchAsync(
-        IndexSnapshot snapshot, List<int>? candidateIndices, string query, CancellationToken cancellationToken)
+        IndexSnapshot snapshot, List<int>? candidateIndices, string query, int branchDepth, CancellationToken cancellationToken)
     {
         float[] queryVector = await _embedder.EmbedQueryAsync(query, cancellationToken).ConfigureAwait(false);
         int dimensions = snapshot.Header.Dimensions;
@@ -379,7 +493,7 @@ public sealed class CodeIndexService
         if (candidateIndices is null)
         {
             VectorSearcher searcher = new(snapshot.Vectors, dimensions);
-            return searcher.Search(queryVector, BranchDepth);
+            return searcher.Search(queryVector, branchDepth, _minCosineSimilarity);
         }
 
         float[] filteredVectors = new float[candidateIndices.Count * dimensions];
@@ -389,7 +503,7 @@ public sealed class CodeIndexService
         }
 
         VectorSearcher filteredSearcher = new(filteredVectors, dimensions);
-        IReadOnlyList<ScoredIndex> localHits = filteredSearcher.Search(queryVector, BranchDepth);
+        IReadOnlyList<ScoredIndex> localHits = filteredSearcher.Search(queryVector, branchDepth, _minCosineSimilarity);
         return RemapToOriginalIndices(localHits, candidateIndices);
     }
 
