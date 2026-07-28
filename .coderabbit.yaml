@@ -1,0 +1,14 @@
+# yaml-language-server: $schema=https://coderabbit.ai/integrations/schema.v2.json
+
+# Automatic review on every push is disabled deliberately. This repository is
+# developed in long agent-driven sessions where a single branch accumulates many
+# commits in a row; reviewing each push produces overlapping findings on code that
+# is still moving. Reviews are requested explicitly instead, once a change has
+# settled, by commenting `@coderabbitai review` on the pull request.
+language: ru
+
+reviews:
+  # Explicit `@coderabbitai review` comments still work with this off.
+  auto_review:
+    enabled: false
+    drafts: false
