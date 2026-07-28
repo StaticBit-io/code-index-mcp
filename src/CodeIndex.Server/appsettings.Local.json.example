@@ -7,7 +7,8 @@
       },
       {
         "Id": "otherproject",
-        "Root": "/path/to/OtherProject"
+        "Root": "/path/to/OtherProject",
+        "Extensions": [ ".cs" ]
       }
     ]
   }

@@ -34,7 +34,9 @@ roughly a third to a half of input tokens, plus fewer wasted iterations chasing 
 - **~10 GB of free VRAM** while the model is resident (see [Known limitations](#known-limitations)
   for what "resident" costs you on a card with less headroom)
 
-Only `.cs` files are indexed. There is no support for other languages or file types.
+By default, `.cs`, `.razor`, and `.md` files are indexed — see
+[Which files get indexed](#which-files-get-indexed) below for how chunking differs by extension
+and how to configure a different set per project.
 
 ## Setup
 
@@ -98,6 +100,13 @@ Only `.cs` files are indexed. There is no support for other languages or file ty
    [Moving the cache between machines](#moving-the-cache-between-machines)). Every `Id` must be
    unique; the server refuses to start (with a message naming the duplicate) if two projects share
    one.
+
+   Each project also has an optional `Extensions` list controlling which files it indexes —
+   defaults to `[".cs", ".razor", ".md"]` when omitted, as above. Set it per project to widen or
+   narrow that set, e.g. `{ "Id": "otherproject", "Root": "...", "Extensions": [".cs"] }` to index
+   only C# for a project with no Razor UI or docs worth indexing. Matching is case-insensitive.
+   See [Which files get indexed](#which-files-get-indexed) below for how chunking differs by
+   extension.
 
    Instead of editing `appsettings.json` directly (and risking committing your local paths), copy
    `src/CodeIndex.Server/appsettings.Local.json.example` to
@@ -380,6 +389,72 @@ repository. Rebuild
 (`dotnet build -c Release`) after pulling changes to this repo; the registration itself does not
 need to change.
 
+## Which files get indexed
+
+Each project's `Extensions` list (see [Setup](#setup), step 4) controls which files it walks —
+`[".cs", ".razor", ".md"]` by default. Which chunker a file goes through is decided by its
+extension, not by trial and error:
+
+- **`.cs`** goes to the structural, Roslyn-based chunker: one chunk per type declaration plus one
+  chunk per indexable member (see [The problem this solves](#the-problem-this-solves)). If Roslyn
+  produces zero chunks for a particular file (syntax Roslyn can't decompose meaningfully — see
+  [Known limitations](#known-limitations)), it falls back to line-window chunking for that file.
+- **Everything else — `.razor`, `.md`, and any other configured extension — goes straight to
+  line-window chunking**, never through Roslyn. This is a routing decision, not merely "try Roslyn,
+  fall back on failure": running the C# parser against Markdown or Razor markup does not throw, it
+  silently produces empty or meaningless structural chunks, so routing away from Roslyn entirely up
+  front is both faster and more honest than relying on that failure mode to happen to look right.
+  Every chunk produced this way carries `kind: "FileFragment"`, same as a `.cs` file that fell back
+  to windowing — see [Narrowing to code](#narrowing-to-code-vs-documentation) below for what that
+  makes possible.
+
+**`.razor` files are windowed, not structurally parsed, even though they hold C# inside `@code`
+blocks.** Roslyn cannot parse a whole `.razor` file as a compilation unit — the surrounding markup
+isn't C# — and hand-extracting just the `@code` block's contents would need a real Razor-aware
+parser (recognizing directives, distinguishing markup from code, finding the block boundaries
+correctly), which does not exist here. Line-window chunking is the honest first step: it indexes
+the file's content, imperfectly segmented, rather than skipping the file or pretending a C# parser
+can make sense of it. Structured Razor parsing is a separate piece of work, not a natural extension
+of the existing chunker.
+
+### Widening `Extensions` on an already-indexed project
+
+Adding an extension to an existing project's `Extensions` (e.g. picking up `.md` for the first
+time) does not invalidate anything already indexed — the newly-matched files are indistinguishable
+from any other newly-added files as far as [incremental refresh](#the-four-tools) is concerned:
+they get chunked and embedded, everything already in the cache is copied through untouched. Verified
+against the project's own 724-file, 8,751-chunk `xrplcsharp` reference index: widening `Extensions`
+from `.cs`-only to the new default (`.cs`, `.razor`, `.md`) picked up 42 more files (38 `.md`, 4
+`.razor`) and 146 more chunks in **21 s** — not the ~7.5 min a from-scratch rebuild of an index this
+size costs — and every one of the original 8,751 chunks came back with byte-identical vectors,
+confirmed by comparing `vectors.bin` before and after for a random sample. Nothing pre-existing was
+re-chunked or re-embedded; only the genuinely new files were.
+
+### Narrowing to code vs. documentation
+
+Widening the default set to include `.md` means a documentation chunk can legitimately outrank the
+code it describes — measured on the 766-file, 8,897-chunk `xrplcsharp` reference index: for
+implementation-style queries ("where do we validate trustline deletion", "how is a payment
+transaction signed", "converting drops to XRP", "retry logic for failed requests", and three more
+from the [query-instruction measurement](#search-quality-the-query-instruction-prefix)), no
+Markdown chunk entered the top 8 results for any of them — the guides in this particular repository
+don't happen to use that vocabulary. But for doc-shaped queries matching this repo's `DocFx/*-Guide.md`
+guides — "how does the lending protocol work", "how do I connect to a rippled node", "how does the
+cross-chain bridge work", "vault deposit and withdraw overview", "how to set up sponsorship for
+account reserves" — a Markdown chunk took **rank 1 in 5 of those 6 queries**, ahead of the code that
+actually implements the feature.
+
+This was not fixed by tuning the ranker — there is no principled way to tell "the guide explaining
+loans" from "the code implementing loans" apart by score alone; both are legitimately relevant to
+"how does the lending protocol work." The fix is `code_search`'s existing `kind` parameter: passing
+any concrete kind (`Class`, `Method`, `Property`, etc.) excludes `FileFragment` chunks entirely,
+since only line-window chunking ever produces that kind — for every one of the five displaced
+queries above, restricting to non-`FileFragment` kinds put the actual implementing code back at or
+near rank 1. There is no dedicated "kind != FileFragment" shorthand; querying once per concrete
+kind and merging (the same pool-and-re-sort approach [multi-project search](#searching-across-projects)
+already uses) is the current way to get "code only" when a query's own vocabulary doesn't already
+avoid the overlap.
+
 ## Untrusted content
 
 Every source fragment `code_search` and `code_get_chunk` return is wrapped in
@@ -410,9 +485,15 @@ the wrapper regardless of case, spacing, or hidden Unicode tricks.
 - **Cold-start cost.** See [Cold start and `KeepAlive`](#cold-start-and-keepalive) above — even
   with `KeepAlive` set, the *first* query after the model has actually unloaded still pays the
   full ~12 s reload.
-- **Not every file gets structural chunks.** Of the 723 files in the measured run, 11 produced no
-  chunks from the Roslyn-based chunker (e.g. syntax that Roslyn can't decompose meaningfully) and
-  fell back to plain line-window chunking for that file instead of per-declaration chunks.
+- **Not every file gets structural chunks.** Of the 723 `.cs` files in the measured run, 11
+  produced no chunks from the Roslyn-based chunker (e.g. syntax that Roslyn can't decompose
+  meaningfully) and fell back to plain line-window chunking for that file instead of
+  per-declaration chunks. Every non-`.cs` file (`.razor`, `.md`, or anything else configured via
+  `Extensions`) is window-chunked unconditionally by design — see
+  [Which files get indexed](#which-files-get-indexed) — not as a fallback from a failed attempt.
+- **Markdown can outrank the code it documents for doc-shaped queries.** See
+  [Narrowing to code vs. documentation](#narrowing-to-code-vs-documentation) for what was measured
+  and how to filter it out with `kind` when it matters.
 - **Chunk ids do not survive a reindex.** Each id (e.g. `"myproject:4137"`) is an ordinal position
   in the specific index snapshot of *that project* a `code_search` call ran against. An explicit
   `code_reindex`, or even an automatic incremental refresh that added/removed/reordered chunks

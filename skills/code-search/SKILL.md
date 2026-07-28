@@ -1,6 +1,6 @@
 ---
 name: code-search
-description: Use when searching a C# codebase indexed by the code-index-mcp server — finding where something is implemented, answering natural-language questions about the code ("where do we validate X", "how is Y computed"), or exploring an unfamiliar area of a large C# project. Prefer this over Grep for that kind of search; keep using Grep for exact string literals, non-.cs files, or when the target file is already known.
+description: Use when searching a C# codebase indexed by the code-index-mcp server — finding where something is implemented, answering natural-language questions about the code ("where do we validate X", "how is Y computed"), or exploring an unfamiliar area of a large C# project. Also covers the project's Markdown docs and Razor components when the indexed project's Extensions include them (the default does). Prefer this over Grep for that kind of search; keep using Grep for exact string literals or when the target file is already known.
 ---
 
 # Code search
@@ -21,13 +21,17 @@ literal occurrence of a string:
   precise type/method name (`TrustSetFlags`) still works well.
 - Exploring an area of the codebase you don't know the layout of yet, where a `Grep` sweep would
   mean reading several false-positive files just to rule them out.
+- "How does X work" / "what is X" conceptual questions — a project's `.md` guides are indexed by
+  default alongside its code (see [Code vs. documentation results](#code-vs-documentation-results)
+  below), so this can surface the explanation, not just the implementation.
 
 Keep using `Grep` when:
 
 - You need an exact string literal (an error message, a config key, a log line) — `code_search`
   ranks by meaning and symbol match, not substring presence.
-- The file is not C# (`.cs`) — this index only covers C# source; everything else (JSON, YAML,
-  Markdown, config) is invisible to it.
+- The file's extension is not one the target project indexes — check its configured `Extensions`
+  (default: `.cs`, `.razor`, `.md`); anything else (JSON, YAML, generated config, etc.) is
+  invisible to `code_search` regardless of how relevant it is.
 - You already know which file the answer is in — just read it.
 
 ## Reading a result
@@ -52,6 +56,23 @@ one from an older search result.
 If the server has more than one project configured, omitting `project` searches all of them and
 merges the results into one ranked list (each hit still names its `project`). Pass `project` to
 scope the search to just one when you already know which codebase you're looking in.
+
+## Code vs. documentation results
+
+A project's `.md` files (and `.razor` files) are chunked by line window, not by declaration, and
+every chunk produced that way carries `kind: "FileFragment"` — the same kind a `.cs` file falls
+back to when Roslyn can't decompose it structurally. Measured on this project's own reference
+index: a doc-shaped question ("how does the lending protocol work", "how do I connect to a
+rippled node") reliably puts a `.md` guide chunk at rank 1, ahead of the code that actually
+implements the feature — genuinely useful when the guide *is* the better answer, but not what you
+want when the task is "show me the implementation."
+
+If a result set looks doc-heavy and the goal is specifically code, pass `kind` set to a concrete
+non-`FileFragment` value (`Class`, `Method`, `Property`, `Constructor`, `Interface`, `Struct`,
+`Record`, `Enum`, `Field`) to exclude every window-chunked file from that call. There is no single
+"kind != FileFragment" shortcut — query once per concrete kind you care about and merge by score if
+several are plausible, the same way multi-project search pools and re-sorts. For most single-answer
+lookups, trying `Class` and `Method` first covers the common case.
 
 ## The `warning` field
 

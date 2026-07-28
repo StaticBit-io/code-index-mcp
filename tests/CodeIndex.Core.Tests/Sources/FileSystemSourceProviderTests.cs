@@ -31,6 +31,69 @@ public sealed class FileSystemSourceProviderTests : IDisposable
         Assert.Equal(new[] { "src/A.cs" }, found);
     }
 
+    // --- Extensions: which files count as "indexable" is configurable per project -----------
+
+    [Fact]
+    public async Task EnumerateAsync_DefaultExtensions_IncludesRazorAndMarkdownAlongsideCs()
+    {
+        File.WriteAllText(Path.Combine(_root, "src", "Component.razor"), "<h1>Hi</h1>");
+        File.WriteAllText(Path.Combine(_root, "src", "Guide.md"), "# Guide");
+        FileSystemSourceProvider provider = new(_root);
+
+        List<string> found = new();
+        await foreach (string path in provider.EnumerateAsync(TestContext.Current.CancellationToken))
+            found.Add(path);
+
+        Assert.Equal(
+            new[] { "src/A.cs", "src/Component.razor", "src/Guide.md" },
+            found.OrderBy(path => path, StringComparer.Ordinal));
+    }
+
+    [Fact]
+    public async Task EnumerateAsync_CustomExtensions_OverrideTheDefaultSet()
+    {
+        File.WriteAllText(Path.Combine(_root, "src", "Guide.md"), "# Guide");
+        FileSystemSourceProvider provider = new(_root, [".md"]);
+
+        List<string> found = new();
+        await foreach (string path in provider.EnumerateAsync(TestContext.Current.CancellationToken))
+            found.Add(path);
+
+        // Only ".md" was configured, so "src/A.cs" — which the default set would include — is
+        // excluded entirely; a custom Extensions list replaces the default, it does not add to it.
+        Assert.Equal(new[] { "src/Guide.md" }, found);
+    }
+
+    [Fact]
+    public async Task EnumerateAsync_ExtensionMatching_IsCaseInsensitive()
+    {
+        File.WriteAllText(Path.Combine(_root, "src", "Shout.CS"), "uppercase extension on disk");
+        File.WriteAllText(Path.Combine(_root, "src", "Guide.md"), "# Guide");
+        // Configured with mixed case too, the other way round from the files on disk.
+        FileSystemSourceProvider provider = new(_root, [".cs", ".Md"]);
+
+        List<string> found = new();
+        await foreach (string path in provider.EnumerateAsync(TestContext.Current.CancellationToken))
+            found.Add(path);
+
+        Assert.Contains("src/Shout.CS", found);
+        Assert.Contains("src/Guide.md", found);
+    }
+
+    [Fact]
+    public async Task EnumerateAsync_UnknownExtension_IsNotIndexed()
+    {
+        // "src/notes.txt" comes from the shared fixture; ".txt" is in neither the default set
+        // nor this custom one.
+        FileSystemSourceProvider provider = new(_root, [".cs", ".md"]);
+
+        List<string> found = new();
+        await foreach (string path in provider.EnumerateAsync(TestContext.Current.CancellationToken))
+            found.Add(path);
+
+        Assert.DoesNotContain("src/notes.txt", found);
+    }
+
     [Fact]
     public async Task ReadLinesAsync_ReturnsInclusiveRange()
     {

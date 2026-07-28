@@ -21,6 +21,22 @@ public sealed class ProjectOptions
     public string? CacheDirectory { get; set; }
 
     /// <summary>
+    /// File extensions indexed for this project, matched case-insensitively against each file's
+    /// name (see <see cref="Sources.FileSystemSourceProvider"/>). Defaults to
+    /// <see cref="DefaultExtensions"/>. Deliberately per-project rather than global: different
+    /// repositories want different sets — a service with no Razor UI has no reason to walk every
+    /// <c>.razor</c> file, and a project that keeps its documentation elsewhere has no reason to
+    /// index <c>.md</c> at all.
+    /// </summary>
+    public List<string> Extensions { get; set; } = new List<string>(DefaultExtensions);
+
+    /// <summary>
+    /// The extension set a project indexes when it does not configure <see cref="Extensions"/>
+    /// explicitly: C# source, Razor components, and Markdown documentation.
+    /// </summary>
+    public static readonly IReadOnlyList<string> DefaultExtensions = [".cs", ".razor", ".md"];
+
+    /// <summary>
     /// Resolves the directory this project's on-disk index cache lives in: <see cref="CacheDirectory"/>
     /// verbatim if set, otherwise <c>%LocalAppData%/code-index-mcp/&lt;Id&gt;</c>.
     /// </summary>

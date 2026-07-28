@@ -5,10 +5,11 @@ namespace CodeIndex.Core.Sources;
 /// <summary>
 /// Reads project source from disk. Symlinks and directory junctions are never followed: a
 /// project directory can arrive from an untrusted source (e.g. a third-party pull request) and a
-/// symlinked <c>*.cs</c> file — say, one pointed at <c>~/.ssh/id_rsa</c> — would otherwise be
-/// enumerated, read, embedded, and handed back to whatever agent later reads a search result. The
-/// <c>*.cs</c> name filter only constrains the link's own name, never its target, so the only
-/// sound fix is to never dereference a reparse point in the first place.
+/// symlinked indexable file — say, one pointed at <c>~/.ssh/id_rsa</c> and named to match one of
+/// <see cref="_extensions"/> — would otherwise be enumerated, read, embedded, and handed back to
+/// whatever agent later reads a search result. The extension filter only constrains the link's
+/// own name, never its target, so the only sound fix is to never dereference a reparse point in
+/// the first place.
 /// </summary>
 public sealed class FileSystemSourceProvider : ISourceProvider
 {
@@ -29,11 +30,21 @@ public sealed class FileSystemSourceProvider : ISourceProvider
 
     private readonly string _root;
     private readonly string _rootWithSeparator;
+    private readonly string[] _extensions;
 
-    public FileSystemSourceProvider(string root)
+    /// <param name="root">The project's source root.</param>
+    /// <param name="extensions">
+    /// File extensions to index (e.g. <c>".cs"</c>), matched case-insensitively against the end
+    /// of each file's name. Defaults to <see cref="ProjectOptions.DefaultExtensions"/> when
+    /// omitted. An empty collection is accepted at face value — it simply indexes nothing, rather
+    /// than silently falling back to the default set — since a caller that explicitly configured
+    /// an empty list presumably meant it.
+    /// </param>
+    public FileSystemSourceProvider(string root, IEnumerable<string>? extensions = null)
     {
         _root = Path.GetFullPath(root);
         _rootWithSeparator = _root.EndsWith(Path.DirectorySeparatorChar) ? _root : _root + Path.DirectorySeparatorChar;
+        _extensions = (extensions ?? ProjectOptions.DefaultExtensions).ToArray();
     }
 
     /// <summary>
@@ -49,15 +60,15 @@ public sealed class FileSystemSourceProvider : ISourceProvider
     public async IAsyncEnumerable<string> EnumerateAsync(
         [EnumeratorCancellation] CancellationToken cancellationToken)
     {
-        foreach (string absolute in EnumerateCsFiles(_root, depth: 0, cancellationToken))
+        foreach (string absolute in EnumerateIndexedFiles(_root, depth: 0, cancellationToken))
         {
             cancellationToken.ThrowIfCancellationRequested();
 
-            // Defence in depth: EnumerateCsFiles already never descends into or yields a
+            // Defence in depth: EnumerateIndexedFiles already never descends into or yields a
             // reparse point, so every path reaching here should already be a genuine,
             // non-symlinked descendant of _root. Re-checking containment on the final path is
             // cheap and catches anything the walk above might have missed (e.g. a future
-            // change to EnumerateCsFiles) before it ever reaches a caller.
+            // change to EnumerateIndexedFiles) before it ever reaches a caller.
             if (!IsUnderRoot(absolute))
                 continue;
 
@@ -88,7 +99,7 @@ public sealed class FileSystemSourceProvider : ISourceProvider
 
     /// <summary>
     /// Resolves a relative path to an absolute one and enforces that it stays under
-    /// <see cref="_root"/>. This is the same containment guarantee <see cref="EnumerateCsFiles"/>
+    /// <see cref="_root"/>. This is the same containment guarantee <see cref="EnumerateIndexedFiles"/>
     /// enforces for enumeration, applied to the other way a path reaches disk I/O: a
     /// <paramref name="relativePath"/> that is unexpectedly rooted (<c>Path.Combine</c> returns a
     /// rooted second argument unchanged) or that walks up via <c>..</c> segments would otherwise
@@ -125,7 +136,7 @@ public sealed class FileSystemSourceProvider : ISourceProvider
     /// independent bound against that same cycle in case some other construct loops without
     /// setting that attribute.
     /// </summary>
-    private static IEnumerable<string> EnumerateCsFiles(string directory, int depth, CancellationToken cancellationToken)
+    private IEnumerable<string> EnumerateIndexedFiles(string directory, int depth, CancellationToken cancellationToken)
     {
         if (depth > MaxDirectoryDepth)
             yield break;
@@ -149,14 +160,30 @@ public sealed class FileSystemSourceProvider : ISourceProvider
                 if (ExcludedSegments.Contains(Path.GetFileName(entry), StringComparer.OrdinalIgnoreCase))
                     continue;
 
-                foreach (string nested in EnumerateCsFiles(entry, depth + 1, cancellationToken))
+                foreach (string nested in EnumerateIndexedFiles(entry, depth + 1, cancellationToken))
                     yield return nested;
             }
-            else if (entry.EndsWith(".cs", StringComparison.OrdinalIgnoreCase))
+            else if (HasIndexedExtension(entry))
             {
                 yield return entry;
             }
         }
+    }
+
+    /// <summary>Whether <paramref name="path"/> ends with one of <see cref="_extensions"/>,
+    /// case-insensitively (so a project configured with <c>".cs"</c> still matches
+    /// <c>Foo.CS</c>). A linear scan, not a set lookup: <see cref="_extensions"/> is a handful of
+    /// entries at most, and a suffix match cannot be expressed as an ordinary hash-set lookup
+    /// anyway (the candidate string is the whole file name, not just its extension).</summary>
+    private bool HasIndexedExtension(string path)
+    {
+        foreach (string extension in _extensions)
+        {
+            if (path.EndsWith(extension, StringComparison.OrdinalIgnoreCase))
+                return true;
+        }
+
+        return false;
     }
 
     /// <summary>Directory listing, or <see langword="null"/> on any access failure — mirrors the

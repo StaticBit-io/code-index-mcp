@@ -69,6 +69,37 @@ public sealed class ProjectOptionsTests
     }
 
     [Fact]
+    public void Extensions_DefaultsToCsRazorAndMd()
+    {
+        ProjectOptions options = new();
+
+        Assert.Equal(new[] { ".cs", ".razor", ".md" }, options.Extensions);
+    }
+
+    [Fact]
+    public void Extensions_DefaultList_IsIndependentPerInstance()
+    {
+        // The default is a mutable List<string>; each ProjectOptions instance must get its own
+        // copy of ProjectOptions.DefaultExtensions rather than sharing one list, or mutating one
+        // project's Extensions would silently leak into every other project's default.
+        ProjectOptions first = new();
+        ProjectOptions second = new();
+
+        first.Extensions.Add(".sql");
+
+        Assert.DoesNotContain(".sql", second.Extensions);
+        Assert.Equal(new[] { ".cs", ".razor", ".md" }, ProjectOptions.DefaultExtensions);
+    }
+
+    [Fact]
+    public void Extensions_CanBeOverriddenPerProject()
+    {
+        ProjectOptions options = new() { Extensions = [".md"] };
+
+        Assert.Equal(new[] { ".md" }, options.Extensions);
+    }
+
+    [Fact]
     public void ValidateId_ThrowsForAColonEvenThoughItIsAcceptedOnSomePlatformFileNames()
     {
         // ':' is rejected unconditionally — see ProjectOptions.ValidateId remarks — because it is

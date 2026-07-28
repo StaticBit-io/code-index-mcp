@@ -86,7 +86,7 @@ public sealed class ProjectRegistry
                 continue;
             }
 
-            ISourceProvider source = new FileSystemSourceProvider(project.Root);
+            ISourceProvider source = new FileSystemSourceProvider(project.Root, project.Extensions);
             IndexStore store = new IndexStore(project.ResolveCacheDirectory());
             IndexBuilder builder = new(source, chunkerPipeline, embeddingClient, store, optionsWrapper);
             CodeIndexService service = new(builder, source, embeddingClient, minCosineSimilarity);
