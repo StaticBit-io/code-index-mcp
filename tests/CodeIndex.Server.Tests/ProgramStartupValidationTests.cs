@@ -21,7 +21,9 @@ public sealed class ProgramStartupValidationTests
     /// test deliberately breaks.
     /// </summary>
     private static string ServerExecutablePath =>
-        Path.Combine(AppContext.BaseDirectory, "CodeIndex.Server.exe");
+        Path.Combine(
+            AppContext.BaseDirectory,
+            OperatingSystem.IsWindows() ? "CodeIndex.Server.exe" : "CodeIndex.Server");
 
     [Fact]
     public async Task DuplicateProjectId_FailsBeforeServing_WithSpecificMessageAndNonZeroExitCode()
