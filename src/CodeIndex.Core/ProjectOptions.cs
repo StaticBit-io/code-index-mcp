@@ -37,6 +37,30 @@ public sealed class ProjectOptions
     public static readonly IReadOnlyList<string> DefaultExtensions = [".cs", ".razor", ".md"];
 
     /// <summary>
+    /// Characters <see cref="ValidateId"/> rejects in addition to path separators and <c>':'</c>
+    /// (which get their own, more specific error messages). Deliberately NOT
+    /// <see cref="Path.GetInvalidFileNameChars"/>: that method returns a much smaller set on
+    /// Unix — effectively just NUL and <c>'/'</c> — which would let an <see cref="Id"/> like
+    /// <c>"bad*name"</c> validate on Linux and then break if the same configuration or an
+    /// existing cache directory is later used on Windows (see "Moving the cache between
+    /// machines" in the README). Using a fixed, Windows-derived set on every platform makes
+    /// <see cref="Id"/> validation — and therefore the resulting cache directory name — portable
+    /// instead of depending on which OS the server happens to be running on.
+    /// </summary>
+    private static readonly char[] InvalidIdChars = BuildInvalidIdChars();
+
+    private static char[] BuildInvalidIdChars()
+    {
+        List<char> chars = new(38) { '"', '<', '>', '|', '*', '?' };
+        for (int code = 0; code < 32; code++)
+        {
+            chars.Add((char)code);
+        }
+
+        return chars.ToArray();
+    }
+
+    /// <summary>
     /// Resolves the directory this project's on-disk index cache lives in: <see cref="CacheDirectory"/>
     /// verbatim if set, otherwise <c>%LocalAppData%/code-index-mcp/&lt;Id&gt;</c>.
     /// </summary>
@@ -104,7 +128,7 @@ public sealed class ProjectOptions
                 $"but was '{Id}'.", nameof(Id));
         }
 
-        int invalidCharIndex = Id.IndexOfAny(Path.GetInvalidFileNameChars());
+        int invalidCharIndex = Id.IndexOfAny(InvalidIdChars);
         if (invalidCharIndex >= 0)
         {
             throw new ArgumentException(
