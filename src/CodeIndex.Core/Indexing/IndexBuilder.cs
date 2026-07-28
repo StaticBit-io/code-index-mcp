@@ -31,7 +31,7 @@ namespace CodeIndex.Core.Indexing;
 /// the remarks on <see cref="BuildAsync"/> and <see cref="RefreshAsync"/>.
 /// </para>
 /// </remarks>
-public sealed class IndexBuilder
+public sealed class IndexBuilder : IIndexBuilder
 {
     private readonly ISourceProvider _sourceProvider;
     private readonly ChunkerPipeline _chunkerPipeline;
@@ -58,6 +58,26 @@ public sealed class IndexBuilder
         // directory and never touches ProjectOptions.Id itself.
         _options.ValidateEmbedBatchSize();
     }
+
+    /// <summary>Whether <paramref name="header"/> was produced by this instance's own embedding
+    /// model/dimensionality — the same test <see cref="ComputeRefreshAsync"/> applies to decide
+    /// whether a full rebuild is unavoidable. Exposed so <see
+    /// cref="Overlays.OverlayIndexBuilder"/> can make that same decision itself, up front, instead
+    /// of letting an incompatible-model rebuild happen only inside a delegated
+    /// <see cref="ComputeRefreshAsync"/> call, where the overlay layer would have no chance to
+    /// notice base was just replaced wholesale and reset its own state accordingly.</summary>
+    internal bool IsCompatibleWithCurrentEmbedder(IndexHeader header) =>
+        header.IsCompatibleWith(_embeddingClient.Model, _embeddingClient.Dimensions);
+
+    /// <summary>Persists a snapshot this instance already computed (typically via <see
+    /// cref="ComputeRefreshAsync"/> with <c>persist: false</c>) as this builder's on-disk index,
+    /// without re-running any diffing. Exists for <see cref="Overlays.OverlayIndexBuilder"/>,
+    /// which needs to commit a composed base+overlay result back to <em>just the base</em>'s own
+    /// store when the change was small enough to fold into base in place (see the design doc) —
+    /// every other caller already goes through <see cref="RefreshAsync"/>/<see cref="BuildAsync"/>,
+    /// which persist as part of computing the result.</summary>
+    internal Task PersistAsync(IndexSnapshot snapshot, CancellationToken cancellationToken) =>
+        _indexStore.SaveAsync(snapshot, cancellationToken);
 
     /// <summary>
     /// Rebuilds the index from scratch: enumerates every source file, chunks it, embeds every
@@ -173,7 +193,30 @@ public sealed class IndexBuilder
     /// re-reads and re-hashes every file unconditionally and is not subject to this blind spot.
     /// </para>
     /// </remarks>
-    public async Task<IndexSnapshot> RefreshAsync(CancellationToken cancellationToken = default, IndexSnapshot? current = null)
+    public Task<IndexSnapshot> RefreshAsync(CancellationToken cancellationToken = default, IndexSnapshot? current = null) =>
+        ComputeRefreshAsync(cancellationToken, current, persist: true);
+
+    /// <summary>
+    /// The full body of <see cref="RefreshAsync"/>, with the final save made optional. Exists so
+    /// <see cref="Overlays.OverlayIndexBuilder"/> can reuse this exact diff/reassemble algorithm —
+    /// cheap no-op fast path, the git-checkout content-match reuse, re-chunking only genuinely
+    /// changed content — against a <em>composed</em> (base + active overlay) snapshot without this
+    /// method persisting that composed result to <see cref="_indexStore"/>, which is rooted at the
+    /// base's own on-disk location and must never hold a whole composed snapshot (that would
+    /// silently turn the base into "whatever branch happened to be active last," exactly the bug
+    /// overlays exist to avoid — see the design doc). <see cref="RefreshAsync"/> itself always
+    /// passes <c>persist: true</c> and is otherwise unchanged, so every existing behaviour and test
+    /// for the plain, non-overlay path is unaffected by this split.
+    /// </summary>
+    /// <remarks>
+    /// The <c>BuildAsync</c> fallback branches below always persist via their own call to <see
+    /// cref="BuildAsync"/> regardless of <paramref name="persist"/> — a full rebuild has no
+    /// "composed, don't save" caller today, and <see cref="BuildAsync"/> saving unconditionally is
+    /// exactly what every existing caller (including <see cref="Overlays.OverlayIndexBuilder"/>,
+    /// which uses <c>BuildAsync</c> to rebuild the base itself) relies on.
+    /// </remarks>
+    internal async Task<IndexSnapshot> ComputeRefreshAsync(
+        CancellationToken cancellationToken, IndexSnapshot? current, bool persist)
     {
         IndexSnapshot? stored = current;
 
@@ -285,7 +328,12 @@ public sealed class IndexBuilder
         }
 
         IndexSnapshot updated = Assemble(stored, resultEntries);
-        await _indexStore.SaveAsync(updated, cancellationToken).ConfigureAwait(false);
+
+        if (persist)
+        {
+            await _indexStore.SaveAsync(updated, cancellationToken).ConfigureAwait(false);
+        }
+
         return updated;
     }
 
@@ -517,12 +565,15 @@ public sealed class IndexBuilder
     /// before ever calling this).
     /// </para>
     /// </remarks>
-    private static bool HasChunkListShapeChanged(IReadOnlyList<CodeChunk> previous, IReadOnlyList<CodeChunk> updated) =>
+    /// <summary>Internal (not private) so <see cref="Overlays.OverlayComposer"/> can apply the
+    /// exact same "did the ordinal-shifting shape change" test to a composed base+overlay snapshot
+    /// without duplicating this logic — see the design doc's generation-stability decision.</summary>
+    internal static bool HasChunkListShapeChanged(IReadOnlyList<CodeChunk> previous, IReadOnlyList<CodeChunk> updated) =>
         !GroupByFileRun(previous).SequenceEqual(GroupByFileRun(updated));
 
     /// <summary>Groups a chunk list — assumed already laid out contiguously per file (see the
     /// class remarks) — into an ordered sequence of (file path, run length) pairs.</summary>
-    private static IEnumerable<(string Path, int Count)> GroupByFileRun(IReadOnlyList<CodeChunk> chunks)
+    internal static IEnumerable<(string Path, int Count)> GroupByFileRun(IReadOnlyList<CodeChunk> chunks)
     {
         int i = 0;
         while (i < chunks.Count)

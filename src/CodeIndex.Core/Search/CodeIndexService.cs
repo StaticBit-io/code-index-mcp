@@ -79,7 +79,7 @@ public sealed class CodeIndexService
     /// <summary>Excerpts shown to callers are capped at this many lines.</summary>
     private const int MaxExcerptLines = 15;
 
-    private readonly IndexBuilder _builder;
+    private readonly IIndexBuilder _builder;
     private readonly ISourceProvider _source;
     private readonly IEmbeddingClient _embedder;
     private readonly float _minCosineSimilarity;
@@ -106,7 +106,7 @@ public sealed class CodeIndexService
     /// configuration for the one path that actually talks to a real embedding backend.
     /// </param>
     public CodeIndexService(
-        IndexBuilder builder,
+        IIndexBuilder builder,
         ISourceProvider source,
         IEmbeddingClient embedder,
         double minCosineSimilarity = double.NegativeInfinity)

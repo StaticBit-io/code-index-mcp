@@ -1,6 +1,7 @@
 using CodeIndex.Core.Chunking;
 using CodeIndex.Core.Embedding;
 using CodeIndex.Core.Indexing;
+using CodeIndex.Core.Overlays;
 using CodeIndex.Core.Sources;
 using CodeIndex.Core.Storage;
 using Microsoft.Extensions.Options;
@@ -87,8 +88,17 @@ public sealed class ProjectRegistry
             }
 
             ISourceProvider source = new FileSystemSourceProvider(project.Root, project.Extensions);
-            IndexStore store = new IndexStore(project.ResolveCacheDirectory());
-            IndexBuilder builder = new(source, chunkerPipeline, embeddingClient, store, optionsWrapper);
+            string cacheDirectory = project.ResolveCacheDirectory();
+            IndexStore store = new IndexStore(cacheDirectory);
+            IndexBuilder indexBuilder = new(source, chunkerPipeline, embeddingClient, store, optionsWrapper);
+
+            // The overlay wrapper is a pure optimisation over the same on-disk base (see the
+            // design doc): when disabled it is never constructed at all, so CodeIndexService gets
+            // byte-for-byte the pre-overlay IndexBuilder wired in directly.
+            IIndexBuilder builder = options.EnableOverlays
+                ? new OverlayIndexBuilder(indexBuilder, source, cacheDirectory, options.MaxOverlays, options.OverlayActivationThreshold)
+                : indexBuilder;
+
             CodeIndexService service = new(builder, source, embeddingClient, minCosineSimilarity);
 
             _entries[project.Id] = new ProjectEntry(service, null, project);

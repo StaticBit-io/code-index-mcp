@@ -4,6 +4,7 @@ using System.Reflection.Metadata;
 using System.Reflection.Metadata.Ecma335;
 using System.Reflection.PortableExecutable;
 using CodeIndex.Core.Sources;
+using CodeIndex.Core.Storage;
 using Xunit;
 
 namespace CodeIndex.Core.Tests.Architecture;
@@ -30,12 +31,16 @@ namespace CodeIndex.Core.Tests.Architecture;
 /// namespace (e.g. <see cref="SourceLines"/>) is provider plumbing, not a leak.
 /// </description></item>
 /// <item><description>
-/// <c>CodeIndex.Core.Storage.IndexStore</c> by exact type name — the single sanctioned
-/// exception outside <c>Sources</c>. It owns the on-disk index cache (<c>manifest.json</c>,
-/// <c>vectors.bin</c>), which lives outside the indexed project entirely: that cache is not
-/// project source code, so it is not subject to <see cref="ISourceProvider"/>'s remit, and
-/// there would be no way to persist or load it at all without touching the real filesystem
-/// somewhere.
+/// <c>CodeIndex.Core.Storage.IndexStore</c> and <c>CodeIndex.Core.Storage.OverlayRegistryStore</c>,
+/// by exact type name — the sanctioned exceptions outside <c>Sources</c>. Both own on-disk index
+/// cache state (<see cref="IndexStore"/>: <c>manifest.json</c>/<c>vectors.bin</c>; <see
+/// cref="OverlayRegistryStore"/>: the per-branch overlay pool's <c>overlays/registry.json</c> and
+/// the overlay slot directories it evicts), which lives outside the indexed project entirely:
+/// that cache is not project source code, so it is not subject to <see cref="ISourceProvider"/>'s
+/// remit, and there would be no way to persist or load it at all without touching the real
+/// filesystem somewhere. An overlay slot's own chunk/fingerprint/vector data is persisted through
+/// a plain <see cref="IndexStore"/> pointed at that slot's directory — reusing the already-exempt
+/// type instead of adding a third one.
 /// </description></item>
 /// </list>
 /// Everywhere else — <c>Chunking</c>, <c>Indexing</c>, <c>Search</c>, <c>Embedding</c> — must
@@ -75,7 +80,12 @@ public sealed class SourceIsolationTests
     private const string ForbiddenNamespace = "System.IO";
 
     private const string ExemptNamespace = "CodeIndex.Core.Sources";
-    private const string ExemptFullTypeName = "CodeIndex.Core.Storage.IndexStore";
+
+    private static readonly HashSet<string> ExemptFullTypeNames = new(StringComparer.Ordinal)
+    {
+        "CodeIndex.Core.Storage.IndexStore",
+        "CodeIndex.Core.Storage.OverlayRegistryStore",
+    };
 
     [Fact]
     public void CoreAssembly_TouchesFileSystemOnlyThroughSourceProviderOrIndexStore()
@@ -114,7 +124,7 @@ public sealed class SourceIsolationTests
             if (string.Equals(outerNamespace, ExemptNamespace, StringComparison.Ordinal))
                 continue;
 
-            if (string.Equals(outerFullName, ExemptFullTypeName, StringComparison.Ordinal))
+            if (ExemptFullTypeNames.Contains(outerFullName))
                 continue;
 
             string displayTypeName = BuildDisplayTypeName(reader, typeHandle);
@@ -159,8 +169,8 @@ public sealed class SourceIsolationTests
     }
 
     /// <summary><c>Namespace.OutermostTypeName</c> for <paramref name="typeHandle"/>'s
-    /// outermost ancestor — used only to compare against <see cref="ExemptFullTypeName"/>,
-    /// which names a top-level type.</summary>
+    /// outermost ancestor — used only to compare against <see cref="ExemptFullTypeNames"/>,
+    /// which names top-level types.</summary>
     private static string ResolveOuterFullName(MetadataReader reader, TypeDefinitionHandle typeHandle)
     {
         TypeDefinitionHandle outerHandle = ResolveOuterTypeHandle(reader, typeHandle);
