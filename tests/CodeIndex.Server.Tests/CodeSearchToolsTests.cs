@@ -161,7 +161,10 @@ public sealed partial class CodeSearchToolsTests : IDisposable
         JsonElement firstHit = hits[0];
         string id = firstHit.GetProperty("id").GetString()!;
         Assert.StartsWith($"{DefaultProjectId}:", id, StringComparison.Ordinal);
-        Assert.True(int.TryParse(id[(DefaultProjectId.Length + 1)..], out _), $"'{id}' should end in an integer ordinal.");
+        string[] idParts = id.Split(':');
+        Assert.Equal(3, idParts.Length);
+        Assert.True(int.TryParse(idParts[1], out _), $"'{id}' should carry an integer generation as its middle segment.");
+        Assert.True(int.TryParse(idParts[2], out _), $"'{id}' should end in an integer ordinal.");
         Assert.Equal(DefaultProjectId, firstHit.GetProperty("project").GetString());
         Assert.Equal("src/A.cs", firstHit.GetProperty("path").GetString());
         Assert.True(firstHit.TryGetProperty("start_line", out _));
@@ -336,7 +339,10 @@ public sealed partial class CodeSearchToolsTests : IDisposable
         WriteFile("src/A.cs", MakeSimpleFile("Acme.A", "Widget", "DoSomething"));
         CodeSearchTools tools = CreateTools(new StubEmbeddingClient());
 
-        string json = await tools.GetChunkAsync($"{DefaultProjectId}:999999", TestContext.Current.CancellationToken);
+        // Generation 0 is what a brand-new, just-built index starts at (see
+        // IndexBuilder.BuildAsync) — this id is well-formed and current-generation, just an
+        // ordinal far beyond how many chunks actually exist.
+        string json = await tools.GetChunkAsync($"{DefaultProjectId}:0:999999", TestContext.Current.CancellationToken);
 
         using JsonDocument document = JsonDocument.Parse(json);
         Assert.True(document.RootElement.TryGetProperty("error", out JsonElement errorElement));
@@ -357,12 +363,55 @@ public sealed partial class CodeSearchToolsTests : IDisposable
     }
 
     [Fact]
+    public async Task CodeGetChunk_LegacyTwoPartId_ReturnsClearErrorAboutTheMissingGeneration()
+    {
+        WriteFile("src/A.cs", MakeSimpleFile("Acme.A", "Widget", "DoSomething"));
+        CodeSearchTools tools = CreateTools(new StubEmbeddingClient());
+
+        // The pre-generation format this server used to emit: "<project>:<ordinal>", no
+        // generation segment at all.
+        string json = await tools.GetChunkAsync($"{DefaultProjectId}:4137", TestContext.Current.CancellationToken);
+
+        using JsonDocument document = JsonDocument.Parse(json);
+        Assert.True(document.RootElement.TryGetProperty("error", out JsonElement errorElement));
+        string message = errorElement.GetString()!;
+        Assert.Contains("older", message, StringComparison.OrdinalIgnoreCase);
+        Assert.Contains("generation", message, StringComparison.OrdinalIgnoreCase);
+    }
+
+    [Fact]
+    public async Task CodeGetChunk_StaleGenerationId_ReturnsClearErrorRatherThanAWrongChunk()
+    {
+        WriteFile("src/A.cs", MakeSimpleFile("Acme.A", "Widget", "DoSomething"));
+        CodeSearchTools tools = CreateTools(new StubEmbeddingClient());
+
+        string searchWrapped = await tools.SearchAsync(
+            "DoSomething", limit: 10, kind: null, path_filter: null, project: null, TestContext.Current.CancellationToken);
+        string searchJson = StripUntrustedContentMarkers(searchWrapped);
+        using JsonDocument searchDocument = JsonDocument.Parse(searchJson);
+        string id = searchDocument.RootElement.GetProperty("hits")[0].GetProperty("id").GetString()!;
+
+        // Adding a second file forces an incremental refresh that bumps the generation (see the
+        // IndexBuilder generation tests) — the id captured above is now stale even though its
+        // ordinal may well still be in range.
+        WriteFile("src/AAA.cs", MakeSimpleFile("Acme.AAA", "Earlier", "DoEarlier"));
+
+        string chunkJson = await tools.GetChunkAsync(id, TestContext.Current.CancellationToken);
+
+        using JsonDocument chunkDocument = JsonDocument.Parse(chunkJson);
+        Assert.True(chunkDocument.RootElement.TryGetProperty("error", out JsonElement errorElement));
+        string message = errorElement.GetString()!;
+        Assert.Contains("older", message, StringComparison.OrdinalIgnoreCase);
+        Assert.Contains("code_search", message, StringComparison.Ordinal);
+    }
+
+    [Fact]
     public async Task CodeGetChunk_UnknownProjectInId_ReturnsErrorListingConfiguredIds()
     {
         WriteFile("src/A.cs", MakeSimpleFile("Acme.A", "Widget", "DoSomething"));
         CodeSearchTools tools = CreateTools(new StubEmbeddingClient());
 
-        string json = await tools.GetChunkAsync("no-such-project:0", TestContext.Current.CancellationToken);
+        string json = await tools.GetChunkAsync("no-such-project:0:0", TestContext.Current.CancellationToken);
 
         using JsonDocument document = JsonDocument.Parse(json);
         Assert.True(document.RootElement.TryGetProperty("error", out JsonElement errorElement));
@@ -529,7 +578,7 @@ public sealed partial class CodeSearchToolsTests : IDisposable
         StubEmbeddingClient embedder = new() { ShouldThrow = true };
         CodeSearchTools tools = CreateTools(embedder);
 
-        string json = await tools.GetChunkAsync($"{DefaultProjectId}:0", TestContext.Current.CancellationToken);
+        string json = await tools.GetChunkAsync($"{DefaultProjectId}:0:0", TestContext.Current.CancellationToken);
 
         using JsonDocument document = JsonDocument.Parse(json);
         Assert.True(document.RootElement.TryGetProperty("error", out JsonElement errorElement));

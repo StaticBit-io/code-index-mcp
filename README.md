@@ -151,11 +151,11 @@ find where something is *implemented*, not to find every literal occurrence of a
 | `project` | string? | `null` | Restrict the search to one configured project's `Id`. Omit to search every configured project and merge the results. |
 
 Returns a ranked list of hits, each with an `id`, the `project` it came from, file path, line
-range, kind, symbol, signature, doc comment (if any), a short excerpt, and a `score`: the fused
-Reciprocal-Rank-Fusion value (not a raw similarity percentage — see
-[Searching across projects](#searching-across-projects) for what feeds it). Higher is better; a
-hit near the bottom of only one branch's ranking is a weak match worth a second look. The vector
-branch also applies a relevance floor before fusion — see
+range, kind, symbol, signature, doc comment (if any), a short excerpt, an optional
+`excerpt_may_be_stale` flag, and a `score`: the fused Reciprocal-Rank-Fusion value (not a raw
+similarity percentage — see [Searching across projects](#searching-across-projects) for what feeds
+it). Higher is better; a hit near the bottom of only one branch's ranking is a weak match worth a
+second look. The vector branch also applies a relevance floor before fusion — see
 [Search quality: the query instruction prefix](#search-quality-the-query-instruction-prefix) and
 `Embedding:MinCosineSimilarity` below — so a query with no genuine semantic match in the index
 does not come back with confident-looking noise. The index refreshes incrementally before every
@@ -166,6 +166,14 @@ known-good snapshot — including one loaded from disk on the very first call of
 process, before this server instance has ever refreshed anything itself — with `warning` explaining
 that the index is stale (see [Known limitations](#known-limitations)).
 
+`excerpt_may_be_stale: true` appears on a hit-by-hit basis (never as a single blanket flag on the
+whole response) when the source file's on-disk size/timestamp no longer match what they were when
+this chunk's line range was captured — most commonly because the file was edited during the search
+itself (query embedding alone takes ~200 ms warm to ~12 s cold — see
+[Measured characteristics](#measured-characteristics) — plenty of time for an edit to land between
+the refresh and the excerpt actually being read). The excerpt is still returned either way; treat
+the flag as "probably still correct, not verified" rather than discarding the hit.
+
 ### `code_get_chunk`
 
 Fetches the full body of one chunk by the `id` returned from a `code_search` hit, for when the
@@ -173,13 +181,20 @@ excerpt isn't enough.
 
 | Parameter | Type | Description |
 |---|---|---|
-| `id` | string | Chunk id from a `code_search` hit's `id` field, e.g. `"myproject:4137"`. |
+| `id` | string | Chunk id from a `code_search` hit's `id` field, e.g. `"myproject:3:4137"`. |
 
 An id is opaque and already names the project it came from — pass it back exactly as `code_search`
-returned it; there is nothing to combine it with. Chunk ids are ordinal positions in **one
-project's** index as it existed at that specific search — they do NOT survive a reindex (an
-explicit `code_reindex`, or an automatic refresh that added/removed/reordered chunks anywhere in
-that project's file order). Always take the id from the most recent `code_search` result.
+returned it; there is nothing to combine it with. An id is `"<project>:<generation>:<ordinal>"`:
+the ordinal is a position in **one project's** index as it existed at that specific search, and
+`generation` names *which* shape of that index it was captured against. Chunk ids do NOT survive a
+reindex (an explicit `code_reindex`, or an automatic refresh that added/removed/reordered chunks
+anywhere in that project's file order) — but reusing a stale one is *detected*, not silently
+resolved: `generation` is compared against the project's current index generation, and a mismatch
+returns a clear "this id is from an older index" error instead of quietly resolving the ordinal
+against whatever chunk now happens to occupy that slot. Always take the id from the most recent
+`code_search` result. The response may also carry `body_may_be_stale: true` — see
+`excerpt_may_be_stale` on `code_search` above; it is the same signal, applied to the one chunk this
+call fetched.
 
 ### `code_index_status`
 
@@ -494,11 +509,24 @@ the wrapper regardless of case, spacing, or hidden Unicode tricks.
 - **Markdown can outrank the code it documents for doc-shaped queries.** See
   [Narrowing to code vs. documentation](#narrowing-to-code-vs-documentation) for what was measured
   and how to filter it out with `kind` when it matters.
-- **Chunk ids do not survive a reindex.** Each id (e.g. `"myproject:4137"`) is an ordinal position
-  in the specific index snapshot of *that project* a `code_search` call ran against. An explicit
-  `code_reindex`, or even an automatic incremental refresh that added/removed/reordered chunks
-  anywhere in that project's file order, invalidates every id from a previous search. Always fetch
-  a fresh id via `code_search` immediately before calling `code_get_chunk`.
+- **Chunk ids do not survive a reindex — but reusing a stale one is now detected, not silently
+  wrong.** Each id (e.g. `"myproject:3:4137"`) is an ordinal position in the specific index
+  snapshot of *that project* a `code_search` call ran against, plus the generation number of that
+  snapshot's chunk-list shape. An explicit `code_reindex`, or even an automatic incremental refresh
+  that added/removed/reordered chunks anywhere in that project's file order, bumps the generation —
+  and `code_get_chunk` compares it before ever touching the ordinal, so a stale id comes back as a
+  clear "this id is from an older index" error rather than resolving to whatever chunk now happens
+  to occupy that ordinal. Always fetch a fresh id via `code_search` immediately before calling
+  `code_get_chunk`.
+- **An excerpt or chunk body can still describe code that has since moved, even with a
+  current-generation id.** The generation check above catches an ordinal pointing at the wrong
+  *chunk*; it does not catch the file's content moving *within* the same chunk between the refresh
+  that computed its line range and the moment the excerpt is actually read — the window is roughly
+  the query-embedding latency (see [Measured characteristics](#measured-characteristics)), long
+  enough for an edit to land mid-search. `code_search`/`code_get_chunk` detect this per hit by
+  comparing the file's current size/timestamp against what they were at that refresh, and set
+  `excerpt_may_be_stale`/`body_may_be_stale` when they differ — the excerpt is still returned, just
+  flagged as unverified rather than presented as certainly accurate.
 - **A project whose `Root` no longer exists is reported, not silently dropped.** `code_search`
   with that `project` explicitly set, or `code_get_chunk` with an id naming it, returns a clear
   error; searching every project skips it with a warning naming it instead of failing the whole

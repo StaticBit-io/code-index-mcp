@@ -200,17 +200,66 @@ public sealed class CodeIndexServiceTests : IDisposable
         int fullLineCount = chunk.EndLine - chunk.StartLine + 1;
         Assert.True(fullLineCount > 15, "fixture must produce a chunk longer than the excerpt cap");
 
-        SearchHit? hit = await service.GetChunkAsync(methodChunkId, TestContext.Current.CancellationToken);
+        int generation = snapshot.Header.Generation;
+        SearchHit? hit = await service.GetChunkAsync(generation, methodChunkId, TestContext.Current.CancellationToken);
 
         Assert.NotNull(hit);
         string[] expectedLines = lines.Skip(chunk.StartLine - 1).Take(fullLineCount).ToArray();
         Assert.Equal(expectedLines, SourceLines.Split(hit!.Excerpt));
 
-        SearchHit? outOfRange = await service.GetChunkAsync(snapshot.Chunks.Count + 100, TestContext.Current.CancellationToken);
+        SearchHit? outOfRange = await service.GetChunkAsync(generation, snapshot.Chunks.Count + 100, TestContext.Current.CancellationToken);
         Assert.Null(outOfRange);
 
-        SearchHit? negative = await service.GetChunkAsync(-1, TestContext.Current.CancellationToken);
+        SearchHit? negative = await service.GetChunkAsync(generation, -1, TestContext.Current.CancellationToken);
         Assert.Null(negative);
+    }
+
+    [Fact]
+    public async Task GetChunkAsync_WrongGeneration_ThrowsStaleChunkIdExceptionRatherThanResolvingTheOrdinal()
+    {
+        InMemorySourceProvider source = new(new Dictionary<string, string>
+        {
+            ["src/A.cs"] = MakeSimpleFile("Acme.A", "Widget", "DoA"),
+        });
+        CodeIndexService service = CreateService(source, new StubEmbeddingClient(), out _);
+
+        IndexSnapshot snapshot = await service.RefreshAsync(TestContext.Current.CancellationToken);
+        int wrongGeneration = snapshot.Header.Generation + 1;
+
+        StaleChunkIdException error = await Assert.ThrowsAsync<StaleChunkIdException>(
+            () => service.GetChunkAsync(wrongGeneration, 0, TestContext.Current.CancellationToken));
+
+        Assert.Equal(wrongGeneration, error.RequestedGeneration);
+        Assert.Equal(snapshot.Header.Generation, error.CurrentGeneration);
+        Assert.Contains("older", error.Message, StringComparison.OrdinalIgnoreCase);
+    }
+
+    [Fact]
+    public async Task GetChunkAsync_GenerationBumpsAfterAFileIsAdded_SoTheOldGenerationIsRejected()
+    {
+        InMemorySourceProvider source = new(new Dictionary<string, string>
+        {
+            ["src/A.cs"] = MakeSimpleFile("Acme.A", "Widget", "DoA"),
+        });
+        CodeIndexService service = CreateService(source, new StubEmbeddingClient(), out _);
+
+        IndexSnapshot before = await service.RefreshAsync(TestContext.Current.CancellationToken);
+        int staleGeneration = before.Header.Generation;
+
+        // Adding a file changes the chunk list's shape — exactly what the generation counter
+        // exists to flag (see IndexBuilder's HasChunkListShapeChanged).
+        source.Set("src/AAA.cs", MakeSimpleFile("Acme.AAA", "Earlier", "DoEarlier"));
+
+        IndexSnapshot after = await service.RefreshAsync(TestContext.Current.CancellationToken);
+
+        Assert.True(after.Header.Generation > staleGeneration);
+
+        await Assert.ThrowsAsync<StaleChunkIdException>(
+            () => service.GetChunkAsync(staleGeneration, 0, TestContext.Current.CancellationToken));
+
+        // The current generation still resolves normally.
+        SearchHit? hit = await service.GetChunkAsync(after.Header.Generation, 0, TestContext.Current.CancellationToken);
+        Assert.NotNull(hit);
     }
 
     [Fact]
@@ -310,7 +359,9 @@ public sealed class CodeIndexServiceTests : IDisposable
         source.Set("src/A.cs", MakeSimpleFile("Acme.A", "Widget", "DoARenamed"));
         embedder.ShouldThrow = true;
 
-        SearchHit? hit = await service.GetChunkAsync(methodChunkId, TestContext.Current.CancellationToken);
+        // The refresh never actually succeeds past the pre-edit snapshot (see the fallback
+        // this test targets), so the generation the caller must pass is still the pre-edit one.
+        SearchHit? hit = await service.GetChunkAsync(original.Header.Generation, methodChunkId, TestContext.Current.CancellationToken);
 
         Assert.NotNull(hit);
         Assert.Equal("Acme.A.Widget.DoA", hit!.Chunk.Symbol);
@@ -327,7 +378,7 @@ public sealed class CodeIndexServiceTests : IDisposable
         CodeIndexService service = CreateService(source, embedder, out _);
 
         await Assert.ThrowsAsync<EmbeddingUnavailableException>(
-            () => service.GetChunkAsync(0, TestContext.Current.CancellationToken));
+            () => service.GetChunkAsync(0, 0, TestContext.Current.CancellationToken));
     }
 
     [Fact]
@@ -475,7 +526,8 @@ public sealed class CodeIndexServiceTests : IDisposable
 
         Assert.Null(freshService.Current);
 
-        SearchHit? hit = await freshService.GetChunkAsync(methodChunkId, TestContext.Current.CancellationToken);
+        SearchHit? hit = await freshService.GetChunkAsync(
+            original.Header.Generation, methodChunkId, TestContext.Current.CancellationToken);
 
         Assert.NotNull(hit);
         Assert.Equal("Acme.A.Widget.DoA", hit!.Chunk.Symbol);
@@ -533,6 +585,163 @@ public sealed class CodeIndexServiceTests : IDisposable
 
         Assert.Contains(result.Hits, h => h.Chunk.FilePath == "src/Alpha.cs");
         Assert.Contains(result.Hits, h => h.Chunk.FilePath == "src/Beta.cs");
+    }
+
+    [Fact]
+    public async Task SearchWithStatusAsync_ExcerptFromAFileEditedDuringTheCall_CarriesTheStalenessSignal()
+    {
+        InMemorySourceProvider inMemory = new(new Dictionary<string, string>
+        {
+            ["src/A.cs"] = MakeSimpleFile("Acme.A", "Widget", "DoA"),
+        });
+        RacyStatSourceProvider source = new(inMemory);
+        CodeIndexService service = CreateService(source, new StubEmbeddingClient(), out _);
+
+        // Build the index normally first.
+        await service.RefreshAsync(TestContext.Current.CancellationToken);
+
+        // Let the upcoming search's own mandatory refresh see the file as unchanged (one normal
+        // stat call), then report a stat that no longer matches the fingerprint captured just now
+        // for every call after that — i.e. the one CodeIndexService performs immediately before
+        // reading each hit's excerpt. This simulates an edit landing after the refresh completed
+        // but before the excerpt was actually read later in the same call, the same window the
+        // project's own measurements put at ~200 ms warm to ~12 s cold (the query-embedding call).
+        SourceFileStat racyStat = new(Length: 99_999, LastWriteTimeUtc: DateTime.UtcNow);
+        source.RaceAfter("src/A.cs", normalCallsBeforeRacing: 1, racyStat);
+
+        SearchResult result = await service.SearchWithStatusAsync(
+            "DoA", limit: 5, kind: null, pathFilter: null, TestContext.Current.CancellationToken);
+
+        Assert.NotEmpty(result.Hits);
+        Assert.All(result.Hits, h => Assert.True(h.ExcerptMayBeStale));
+
+        // The excerpt is still returned despite the flag — a probably-correct excerpt with a
+        // caveat, not withheld entirely.
+        Assert.All(result.Hits, h => Assert.False(string.IsNullOrEmpty(h.Excerpt)));
+    }
+
+    [Fact]
+    public async Task SearchWithStatusAsync_ExcerptFromAnUntouchedFile_DoesNotCarryTheStalenessSignal()
+    {
+        InMemorySourceProvider source = new(new Dictionary<string, string>
+        {
+            ["src/A.cs"] = MakeSimpleFile("Acme.A", "Widget", "DoA"),
+        });
+        CodeIndexService service = CreateService(source, new StubEmbeddingClient(), out _);
+
+        SearchResult result = await service.SearchWithStatusAsync(
+            "DoA", limit: 5, kind: null, pathFilter: null, TestContext.Current.CancellationToken);
+
+        Assert.NotEmpty(result.Hits);
+        Assert.All(result.Hits, h => Assert.False(h.ExcerptMayBeStale));
+    }
+
+    [Fact]
+    public async Task GetChunkAsync_BodyFromAFileEditedDuringTheCall_CarriesTheStalenessSignal()
+    {
+        InMemorySourceProvider inMemory = new(new Dictionary<string, string>
+        {
+            ["src/A.cs"] = MakeSimpleFile("Acme.A", "Widget", "DoA"),
+        });
+        RacyStatSourceProvider source = new(inMemory);
+        CodeIndexService service = CreateService(source, new StubEmbeddingClient(), out _);
+
+        IndexSnapshot snapshot = await service.RefreshAsync(TestContext.Current.CancellationToken);
+        int methodChunkId = Array.FindIndex(snapshot.Chunks.ToArray(), c => c.Kind == ChunkKind.Method);
+        Assert.True(methodChunkId >= 0);
+
+        SourceFileStat racyStat = new(Length: 99_999, LastWriteTimeUtc: DateTime.UtcNow);
+        source.RaceAfter("src/A.cs", normalCallsBeforeRacing: 1, racyStat);
+
+        SearchHit? hit = await service.GetChunkAsync(
+            snapshot.Header.Generation, methodChunkId, TestContext.Current.CancellationToken);
+
+        Assert.NotNull(hit);
+        Assert.True(hit!.ExcerptMayBeStale);
+        Assert.False(string.IsNullOrEmpty(hit.Excerpt));
+    }
+
+    [Fact]
+    public async Task GetChunkAsync_BodyFromAnUntouchedFile_DoesNotCarryTheStalenessSignal()
+    {
+        InMemorySourceProvider source = new(new Dictionary<string, string>
+        {
+            ["src/A.cs"] = MakeSimpleFile("Acme.A", "Widget", "DoA"),
+        });
+        CodeIndexService service = CreateService(source, new StubEmbeddingClient(), out _);
+
+        IndexSnapshot snapshot = await service.RefreshAsync(TestContext.Current.CancellationToken);
+        int methodChunkId = Array.FindIndex(snapshot.Chunks.ToArray(), c => c.Kind == ChunkKind.Method);
+        Assert.True(methodChunkId >= 0);
+
+        SearchHit? hit = await service.GetChunkAsync(
+            snapshot.Header.Generation, methodChunkId, TestContext.Current.CancellationToken);
+
+        Assert.NotNull(hit);
+        Assert.False(hit!.ExcerptMayBeStale);
+    }
+
+    /// <summary>
+    /// Wraps an <see cref="ISourceProvider"/> so a test can simulate a concurrent edit landing
+    /// mid-call: after a configured number of legitimate <see cref="StatAsync"/> calls for a given
+    /// path (typically the one a search's own mandatory refresh performs to confirm nothing
+    /// changed), every subsequent call for that path returns a fixed, mismatched stat instead of
+    /// delegating — modelling the real race the "excerpt may be stale" signal exists to catch,
+    /// which cannot otherwise be reproduced deterministically without real concurrent disk I/O.
+    /// </summary>
+    private sealed class RacyStatSourceProvider : ISourceProvider
+    {
+        private readonly ISourceProvider _inner;
+        private readonly object _gate = new();
+        private readonly Dictionary<string, int> _remainingNormalCalls = new(StringComparer.Ordinal);
+        private readonly Dictionary<string, SourceFileStat> _racyStats = new(StringComparer.Ordinal);
+
+        public RacyStatSourceProvider(ISourceProvider inner) => _inner = inner;
+
+        public void RaceAfter(string relativePath, int normalCallsBeforeRacing, SourceFileStat racyStat)
+        {
+            lock (_gate)
+            {
+                _remainingNormalCalls[relativePath] = normalCallsBeforeRacing;
+                _racyStats[relativePath] = racyStat;
+            }
+        }
+
+        public IAsyncEnumerable<string> EnumerateAsync(CancellationToken cancellationToken) =>
+            _inner.EnumerateAsync(cancellationToken);
+
+        public Task<string> ReadTextAsync(string relativePath, CancellationToken cancellationToken) =>
+            _inner.ReadTextAsync(relativePath, cancellationToken);
+
+        public Task<string> ReadLinesAsync(string relativePath, int startLine, int endLine, CancellationToken cancellationToken) =>
+            _inner.ReadLinesAsync(relativePath, startLine, endLine, cancellationToken);
+
+        public async Task<SourceFileStat> StatAsync(string relativePath, CancellationToken cancellationToken)
+        {
+            bool useRacyStat;
+            lock (_gate)
+            {
+                if (_remainingNormalCalls.TryGetValue(relativePath, out int remaining) && remaining <= 0)
+                {
+                    useRacyStat = true;
+                }
+                else
+                {
+                    useRacyStat = false;
+                    if (_remainingNormalCalls.ContainsKey(relativePath))
+                    {
+                        _remainingNormalCalls[relativePath] = remaining - 1;
+                    }
+                }
+            }
+
+            if (useRacyStat)
+            {
+                return _racyStats[relativePath];
+            }
+
+            return await _inner.StatAsync(relativePath, cancellationToken).ConfigureAwait(false);
+        }
     }
 
     /// <summary>Behaves exactly like <see cref="StubEmbeddingClient"/> until toggled, then

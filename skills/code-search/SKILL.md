@@ -45,11 +45,16 @@ file, since it's one targeted read of just that declaration's line range.
 
 ## Chunk ids are single-use
 
-An `id` is `"<project>:<ordinal>"` and is only valid against the index snapshot that produced it.
-It does **not** survive a reindex — an explicit `code_reindex`, or even an automatic incremental
-refresh that changed the file order upstream of that chunk. Pass the id straight from a
+An `id` is `"<project>:<generation>:<ordinal>"` and is only valid against the index snapshot that
+produced it. It does **not** survive a reindex — an explicit `code_reindex`, or even an automatic
+incremental refresh that changed the file order upstream of that chunk. Pass the id straight from a
 `code_search` hit into `code_get_chunk` in the same turn; don't cache an id across turns or reuse
 one from an older search result.
+
+Reusing a stale id is not a silent risk: `code_get_chunk` checks the `generation` segment against
+the project's current index and returns a clear "this id is from an older index" error instead of
+resolving the ordinal against whatever chunk now happens to sit there. If that happens, just call
+`code_search` again for a fresh id — don't try to reconstruct or guess one.
 
 ## Multi-project scope
 
@@ -86,6 +91,16 @@ lookups, trying `Class` and `Method` first covers the common case.
 
 Both are still usable results, not errors — read `warning` to know how much to trust freshness or
 semantic ranking, but don't discard the hits just because it's present.
+
+## Per-hit staleness: `excerpt_may_be_stale` / `body_may_be_stale`
+
+Separately from `warning` (which covers the whole response), an individual hit can carry
+`excerpt_may_be_stale: true` (or, from `code_get_chunk`, `body_may_be_stale: true`) when the source
+file changed after this chunk's line range was captured — most often an edit landing while the
+search itself was still running (embedding the query alone can take from ~200 ms to several
+seconds). The excerpt/body is still returned; the flag means "probably still right, not verified,"
+not "wrong." If precision matters for that specific hit, re-read the file directly rather than
+trusting the excerpt at face value.
 
 ## Honest limits
 

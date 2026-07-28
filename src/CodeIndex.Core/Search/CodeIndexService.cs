@@ -142,13 +142,30 @@ public sealed class CodeIndexService
         }
     }
 
-    /// <summary>Forces a full rebuild from scratch. Serialised by the same gate as <see cref="RefreshAsync"/>.</summary>
+    /// <summary>
+    /// Forces a full rebuild from scratch. Serialised by the same gate as <see cref="RefreshAsync"/>.
+    /// </summary>
+    /// <remarks>
+    /// Passes this instance's own in-memory <see cref="_current"/> snapshot's generation (if any)
+    /// through to <see cref="IndexBuilder.BuildAsync"/> so the rebuilt index's generation is
+    /// guaranteed to differ from whatever generation an outstanding id from before this call might
+    /// carry — see <see cref="IndexBuilder.BuildAsync"/>'s own remarks. This deliberately does not
+    /// go through <see cref="IndexBuilder.TryLoadStoredSnapshotAsync"/> first the way
+    /// <see cref="RefreshOrFallBackAsync"/> does for a fresh process's first call: an explicit,
+    /// user-requested rebuild already pays for re-embedding the entire project, so the marginal
+    /// safety of also reading the old on-disk generation first is not worth adding a second full
+    /// manifest+vector load to every rebuild. The residual gap — a rebuild on a brand-new process
+    /// that never even peeked at the old on-disk generation — starts counting from 0 instead of
+    /// one past whatever the disk actually held, which is still safe in practice: an MCP client
+    /// starts a fresh server process per session, so nothing from a previous process's ids is
+    /// still outstanding by the time a new process's first call happens.
+    /// </remarks>
     public async Task<IndexSnapshot> RebuildAsync(CancellationToken cancellationToken = default)
     {
         await _gate.WaitAsync(cancellationToken).ConfigureAwait(false);
         try
         {
-            IndexSnapshot snapshot = await _builder.BuildAsync(cancellationToken).ConfigureAwait(false);
+            IndexSnapshot snapshot = await _builder.BuildAsync(cancellationToken, _current?.Header.Generation).ConfigureAwait(false);
             _current = snapshot;
             return snapshot;
         }
@@ -364,17 +381,24 @@ public sealed class CodeIndexService
 
         IReadOnlyList<ScoredIndex> fused = HybridRanker.Fuse(vectorHits, symbolHits, limit);
 
-        // Excerpt reads are independent ISourceProvider calls (one file read each), so running
-        // them concurrently instead of one-at-a-time keeps this linear in wall-clock file I/O
-        // only for the slowest read, not the sum of all of them — worth doing now that `limit`
-        // (and therefore fused.Count) is no longer capped at a small fixed branch depth.
+        // Excerpt reads (and the staleness check alongside each one — see IsExcerptPossiblyStaleAsync)
+        // are independent ISourceProvider calls (one file read/stat each), so running them
+        // concurrently instead of one-at-a-time keeps this linear in wall-clock file I/O only for
+        // the slowest read, not the sum of all of them — worth doing now that `limit` (and
+        // therefore fused.Count) is no longer capped at a small fixed branch depth.
+        Dictionary<string, FileFingerprint> fingerprintByPath = BuildFingerprintLookup(snapshot);
         Task<string>[] excerptTasks = new Task<string>[fused.Count];
+        Task<bool>[] stalenessTasks = new Task<bool>[fused.Count];
         for (int i = 0; i < fused.Count; i++)
         {
-            excerptTasks[i] = ReadExcerptAsync(snapshot.Chunks[fused[i].Index], cancellationToken);
+            CodeChunk chunk = snapshot.Chunks[fused[i].Index];
+            excerptTasks[i] = ReadExcerptAsync(chunk, cancellationToken);
+            stalenessTasks[i] = IsExcerptPossiblyStaleAsync(
+                fingerprintByPath.GetValueOrDefault(chunk.FilePath), chunk.FilePath, cancellationToken);
         }
 
         string[] excerpts = await Task.WhenAll(excerptTasks).ConfigureAwait(false);
+        bool[] staleFlags = await Task.WhenAll(stalenessTasks).ConfigureAwait(false);
 
         List<SearchHit> hits = new(fused.Count);
         for (int i = 0; i < fused.Count; i++)
@@ -383,9 +407,11 @@ public sealed class CodeIndexService
             hits.Add(new SearchHit
             {
                 ChunkId = scored.Index,
+                Generation = snapshot.Header.Generation,
                 Chunk = snapshot.Chunks[scored.Index],
                 Score = scored.Score,
                 Excerpt = excerpts[i],
+                ExcerptMayBeStale = staleFlags[i],
             });
         }
 
@@ -393,21 +419,35 @@ public sealed class CodeIndexService
     }
 
     /// <summary>
-    /// Reads the full body of one chunk by its ordinal id in the current snapshot. Like <see
-    /// cref="SearchWithStatusAsync"/>, the mandatory refresh falls back to the last known-good
-    /// snapshot when it fails with <see cref="EmbeddingUnavailableException"/> (see <see
-    /// cref="RefreshOrFallBackAsync"/>) instead of failing outright — a chunk lookup against a
-    /// slightly stale index is still useful, and there is no warning channel here to lose (unlike
-    /// <see cref="SearchResult"/>, <see cref="SearchHit"/> carries no staleness flag). Returns
-    /// <c>null</c> when <paramref name="chunkId"/> is out of range for whichever snapshot (fresh
-    /// or stale) ends up in use — see the ordinal-id volatility warning on <see
-    /// cref="IndexSnapshot"/>: an id obtained from one snapshot must never be looked up after a
-    /// later refresh has changed chunk counts upstream of it.
+    /// Reads the full body of one chunk by its ordinal id (and the generation it was captured
+    /// against) in the current snapshot. Like <see cref="SearchWithStatusAsync"/>, the mandatory
+    /// refresh falls back to the last known-good snapshot when it fails with <see
+    /// cref="EmbeddingUnavailableException"/> (see <see cref="RefreshOrFallBackAsync"/>) instead of
+    /// failing outright — a chunk lookup against a slightly stale index is still useful.
     /// </summary>
-    public async Task<SearchHit?> GetChunkAsync(int chunkId, CancellationToken cancellationToken = default)
+    /// <exception cref="StaleChunkIdException">
+    /// <paramref name="generation"/> does not match the current snapshot's <see
+    /// cref="IndexHeader.Generation"/>. Checked <em>before</em> the ordinal bounds check below: a
+    /// generation mismatch means <paramref name="chunkId"/> is not trustworthy at all in the
+    /// current snapshot, even when it happens to be in range — it could easily now name a
+    /// completely different declaration than the one the caller actually asked for (see the
+    /// ordinal-id volatility warning on <see cref="IndexSnapshot"/>). Silently resolving that,
+    /// rather than throwing, is exactly the "plausible but wrong" failure this check exists to
+    /// prevent.
+    /// </exception>
+    /// <returns>
+    /// <see langword="null"/> when <paramref name="chunkId"/> is out of range for whichever
+    /// snapshot (fresh or stale) ends up in use, given a generation that already matched.
+    /// </returns>
+    public async Task<SearchHit?> GetChunkAsync(int generation, int chunkId, CancellationToken cancellationToken = default)
     {
         RefreshOutcome refreshed = await RefreshOrFallBackAsync(cancellationToken).ConfigureAwait(false);
         IndexSnapshot snapshot = refreshed.Snapshot;
+
+        if (generation != snapshot.Header.Generation)
+        {
+            throw new StaleChunkIdException(generation, snapshot.Header.Generation);
+        }
 
         if (chunkId < 0 || chunkId >= snapshot.Chunks.Count)
         {
@@ -417,14 +457,107 @@ public sealed class CodeIndexService
         CodeChunk chunk = snapshot.Chunks[chunkId];
         string body = await ReadRangeAsync(chunk.FilePath, chunk.StartLine, chunk.EndLine, cancellationToken)
             .ConfigureAwait(false);
+        bool stale = await IsExcerptPossiblyStaleAsync(
+            FindFingerprint(snapshot, chunk.FilePath), chunk.FilePath, cancellationToken).ConfigureAwait(false);
 
         return new SearchHit
         {
             ChunkId = chunkId,
+            Generation = generation,
             Chunk = chunk,
             Score = 0,
             Excerpt = body,
+            ExcerptMayBeStale = stale,
         };
+    }
+
+    /// <summary>Builds a one-shot lookup from every fingerprinted file's relative path to its
+    /// recorded <see cref="FileFingerprint"/>, so a multi-hit search does a single dictionary build
+    /// instead of a linear scan of <see cref="IndexSnapshot.Fingerprints"/> per hit.</summary>
+    private static Dictionary<string, FileFingerprint> BuildFingerprintLookup(IndexSnapshot snapshot)
+    {
+        Dictionary<string, FileFingerprint> lookup = new(snapshot.Fingerprints.Count, StringComparer.Ordinal);
+        foreach (FileFingerprint fingerprint in snapshot.Fingerprints)
+        {
+            lookup[fingerprint.RelativePath] = fingerprint;
+        }
+
+        return lookup;
+    }
+
+    /// <summary>Linear-scan counterpart to <see cref="BuildFingerprintLookup"/> for the
+    /// single-chunk <see cref="GetChunkAsync"/> path, where building a whole dictionary for one
+    /// lookup would not pay for itself.</summary>
+    private static FileFingerprint? FindFingerprint(IndexSnapshot snapshot, string filePath)
+    {
+        foreach (FileFingerprint candidate in snapshot.Fingerprints)
+        {
+            if (string.Equals(candidate.RelativePath, filePath, StringComparison.Ordinal))
+            {
+                return candidate;
+            }
+        }
+
+        return null;
+    }
+
+    /// <summary>
+    /// Whether an excerpt/body about to be read for <paramref name="filePath"/> might no longer
+    /// correspond to the chunk's stored line range. Compares <paramref name="fingerprint"/> — the
+    /// file's size and last-write-time as they were at the point the refresh that produced the
+    /// current chunk list captured them — against a fresh stat taken right now, at read time.
+    /// </summary>
+    /// <remarks>
+    /// <para>
+    /// This targets a narrower, harder-to-close window than <see cref="IndexHeader.Generation"/>:
+    /// even a chunk whose ordinal is entirely valid (right generation, right chunk) can have had
+    /// its file edited in the gap between the refresh that computed its line range and this read —
+    /// the query-embedding latency in <see cref="SearchWithStatusAsync"/> is roughly 200 ms warm,
+    /// up to about 12 s cold (see the project's own measured numbers), which is plenty of time for
+    /// an editor to save a change. There is no lock that could close this window without making the
+    /// index atomic with respect to an external editor writing files, which this project
+    /// deliberately does not attempt (see <see cref="Storage.IndexStore"/>'s own remarks on why
+    /// exact atomicity is not the goal here) — the honest answer is to detect and flag it, not to
+    /// prevent it.
+    /// </para>
+    /// <para>
+    /// A missing <paramref name="fingerprint"/> (defensive; should not happen via any normal
+    /// build/refresh path — see <see cref="IndexBuilder.DecomposeByFile"/>) and a stat failure
+    /// (the file was deleted or became unreadable after the fingerprint was captured) both return
+    /// <see langword="true"/>: with nothing trustworthy to compare against, the honest answer is
+    /// "cannot vouch for this excerpt," not "assume it is fine."
+    /// </para>
+    /// <para>
+    /// Per-hit, not a single blanket warning on the whole <see cref="SearchResult"/>: a search
+    /// commonly mixes a file edited seconds ago with a dozen untouched ones, and flagging every hit
+    /// in the result because one file raced an edit would drown out the signal for the hits that
+    /// are, in fact, still accurate. The excerpt itself is always still returned regardless of this
+    /// flag — a probably-correct excerpt with a caveat remains more useful than withholding it, and
+    /// this flag is precisely what lets a caller tell the two situations apart instead of silently
+    /// trusting an excerpt that may no longer match its reported line range.
+    /// </para>
+    /// </remarks>
+    private async Task<bool> IsExcerptPossiblyStaleAsync(
+        FileFingerprint? fingerprint, string filePath, CancellationToken cancellationToken)
+    {
+        if (fingerprint is null)
+        {
+            return true;
+        }
+
+        try
+        {
+            SourceFileStat current = await _source.StatAsync(filePath, cancellationToken).ConfigureAwait(false);
+            return fingerprint.NeedsContentCheck(current);
+        }
+        catch (IOException)
+        {
+            return true;
+        }
+        catch (UnauthorizedAccessException)
+        {
+            return true;
+        }
     }
 
     /// <summary>
@@ -560,4 +693,30 @@ public sealed class CodeIndexService
             return string.Empty;
         }
     }
+}
+
+/// <summary>
+/// Thrown by <see cref="CodeIndexService.GetChunkAsync"/> when the generation embedded in a
+/// caller's chunk id does not match the project's current <see cref="IndexHeader.Generation"/>.
+/// The id was captured against an earlier shape of the chunk list — one that has since had files
+/// added, removed, or re-chunked into a different member count (see <see
+/// cref="Indexing.IndexBuilder"/>'s generation-bumping remarks) — so its ordinal is no longer
+/// trustworthy even when it happens to still be in range for the current snapshot: it could easily
+/// now name a completely unrelated declaration. This is what turns that into a clear, actionable
+/// error instead of a silent wrong answer.
+/// </summary>
+public sealed class StaleChunkIdException : Exception
+{
+    public StaleChunkIdException(int requestedGeneration, int currentGeneration)
+        : base(
+            $"This chunk id is from an older version of the index (generation {requestedGeneration}); " +
+            $"the current index is generation {currentGeneration}. Run code_search again to get a fresh id.")
+    {
+        RequestedGeneration = requestedGeneration;
+        CurrentGeneration = currentGeneration;
+    }
+
+    public int RequestedGeneration { get; }
+
+    public int CurrentGeneration { get; }
 }

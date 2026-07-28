@@ -71,6 +71,39 @@ public sealed class IndexStoreTests : IDisposable
     }
 
     [Fact]
+    public async Task SaveThenLoad_RoundTripsGeneration()
+    {
+        IndexStore store = new(_dir);
+        IndexSnapshot original = BuildSnapshot() with { Header = BuildSnapshot().Header with { Generation = 7 } };
+
+        await store.SaveAsync(original, TestContext.Current.CancellationToken);
+        IndexSnapshot loaded = await store.LoadAsync(TestContext.Current.CancellationToken)
+            ?? throw new InvalidOperationException("expected a snapshot");
+
+        Assert.Equal(7, loaded.Header.Generation);
+    }
+
+    [Fact]
+    public async Task LoadAsync_DefaultsGenerationToZero_ForAManifestFromBeforeGenerationsExisted()
+    {
+        // Simulates loading a real, pre-existing cache written before IndexHeader.Generation was
+        // added: the "Generation" property is entirely absent from the JSON, not merely null.
+        // This must default to 0 and load normally -- NOT be treated as corrupted/incompatible and
+        // trigger a silent rebuild of what could be an expensive, real, multi-minute cache.
+        IndexStore store = new(_dir);
+        await store.SaveAsync(BuildSnapshot(), TestContext.Current.CancellationToken);
+
+        JsonObject manifest = await ReadManifestAsJsonAsync(store, TestContext.Current.CancellationToken);
+        Assert.True(manifest["Header"]!.AsObject().Remove("Generation"), "fixture must actually carry a Generation property to remove");
+        await WriteManifestAsync(store, manifest, TestContext.Current.CancellationToken);
+
+        IndexSnapshot loaded = await store.LoadAsync(TestContext.Current.CancellationToken)
+            ?? throw new InvalidOperationException("expected a snapshot");
+
+        Assert.Equal(0, loaded.Header.Generation);
+    }
+
+    [Fact]
     public async Task LoadAsync_ReturnsNullWhenNothingWasSaved()
     {
         IndexStore store = new(_dir);

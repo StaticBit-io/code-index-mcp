@@ -146,6 +146,147 @@ public sealed class IndexBuilderTests : IDisposable
     }
 
     [Fact]
+    public async Task RefreshAsync_WithNothingChanged_DoesNotBumpTheGeneration()
+    {
+        InMemorySourceProvider source = new(new Dictionary<string, string>
+        {
+            ["src/A.cs"] = MakeFile("Acme.A", "Widget", "DoA"),
+        });
+        IndexBuilder builder = CreateBuilder(source, new StubEmbeddingClient(), out _);
+        IndexSnapshot original = await builder.BuildAsync(TestContext.Current.CancellationToken);
+
+        IndexSnapshot refreshed = await builder.RefreshAsync(TestContext.Current.CancellationToken);
+
+        Assert.Equal(original.Header.Generation, refreshed.Header.Generation);
+    }
+
+    [Fact]
+    public async Task RefreshAsync_GitCheckoutCase_DoesNotBumpTheGenerationEitherEvenThoughItReassembles()
+    {
+        // Same fixture as RefreshAsync_GitCheckoutCase_DoesNotReEmbedButRefreshesTheFingerprintStamp:
+        // stat differs (so Assemble does run), content does not (so the chunk list's shape is
+        // byte-for-byte the same afterwards) — this is the case the generation counter must not
+        // treat as a shift, even though it is not the cheap "nothing needs attention at all" path.
+        string content = MakeFile("Acme.A", "Widget", "DoA");
+        InMemorySourceProvider source = new(new Dictionary<string, string> { ["src/A.cs"] = content });
+        IndexBuilder builder = CreateBuilder(source, new StubEmbeddingClient(), out _);
+        IndexSnapshot original = await builder.BuildAsync(TestContext.Current.CancellationToken);
+
+        source.Set("src/A.cs", content);
+
+        IndexSnapshot refreshed = await builder.RefreshAsync(TestContext.Current.CancellationToken);
+
+        Assert.Equal(original.Header.Generation, refreshed.Header.Generation);
+    }
+
+    [Fact]
+    public async Task RefreshAsync_AddingAFileBumpsTheGeneration()
+    {
+        InMemorySourceProvider source = new(new Dictionary<string, string>
+        {
+            ["src/A.cs"] = MakeFile("Acme.A", "Widget", "DoA"),
+        });
+        IndexBuilder builder = CreateBuilder(source, new StubEmbeddingClient(), out _);
+        IndexSnapshot original = await builder.BuildAsync(TestContext.Current.CancellationToken);
+
+        source.Set("src/B.cs", MakeFile("Acme.B", "Gadget", "DoB"));
+
+        IndexSnapshot refreshed = await builder.RefreshAsync(TestContext.Current.CancellationToken);
+
+        Assert.Equal(original.Header.Generation + 1, refreshed.Header.Generation);
+    }
+
+    [Fact]
+    public async Task RefreshAsync_RemovingAFileBumpsTheGeneration()
+    {
+        InMemorySourceProvider source = new(new Dictionary<string, string>
+        {
+            ["src/A.cs"] = MakeFile("Acme.A", "Widget", "DoA"),
+            ["src/B.cs"] = MakeFile("Acme.B", "Gadget", "DoB"),
+        });
+        IndexBuilder builder = CreateBuilder(source, new StubEmbeddingClient(), out _);
+        IndexSnapshot original = await builder.BuildAsync(TestContext.Current.CancellationToken);
+
+        source.Remove("src/B.cs");
+
+        IndexSnapshot refreshed = await builder.RefreshAsync(TestContext.Current.CancellationToken);
+
+        Assert.Equal(original.Header.Generation + 1, refreshed.Header.Generation);
+    }
+
+    [Fact]
+    public async Task RefreshAsync_ReChunkingAFileToADifferentMemberCountBumpsTheGeneration()
+    {
+        // Content changes AND the member count changes (a method added) -- this is the exact
+        // shape that shifts every later file's ordinals, distinct from an edit that leaves the
+        // member count (and therefore every later ordinal) untouched.
+        InMemorySourceProvider source = new(new Dictionary<string, string>
+        {
+            ["src/A.cs"] = MakeFile("Acme.A", "Widget", "DoA"),
+            ["src/B.cs"] = MakeFile("Acme.B", "Gadget", "DoB"),
+        });
+        IndexBuilder builder = CreateBuilder(source, new StubEmbeddingClient(), out _);
+        IndexSnapshot original = await builder.BuildAsync(TestContext.Current.CancellationToken);
+
+        source.Set("src/A.cs", $$"""
+            namespace Acme.A
+            {
+                public class Widget
+                {
+                    public int DoA()
+                    {
+                        return 1;
+                    }
+
+                    public int DoAExtra()
+                    {
+                        return 2;
+                    }
+                }
+            }
+            """);
+
+        IndexSnapshot refreshed = await builder.RefreshAsync(TestContext.Current.CancellationToken);
+
+        Assert.Equal(original.Header.Generation + 1, refreshed.Header.Generation);
+    }
+
+    [Fact]
+    public async Task RefreshAsync_EditingAFileWithoutChangingItsMemberCountDoesNotBumpTheGeneration()
+    {
+        // Body-only edit: same file, same single method, different content -- this must re-embed
+        // (it is not the git-checkout case) but must NOT shift any other file's ordinals, so the
+        // generation must stay put.
+        InMemorySourceProvider source = new(new Dictionary<string, string>
+        {
+            ["src/A.cs"] = MakeFile("Acme.A", "Widget", "DoA"),
+            ["src/B.cs"] = MakeFile("Acme.B", "Gadget", "DoB"),
+        });
+        IndexBuilder builder = CreateBuilder(source, new StubEmbeddingClient(), out _);
+        IndexSnapshot original = await builder.BuildAsync(TestContext.Current.CancellationToken);
+
+        source.Set("src/B.cs", MakeFile("Acme.B", "Gadget", "DoBRenamed"));
+
+        IndexSnapshot refreshed = await builder.RefreshAsync(TestContext.Current.CancellationToken);
+
+        Assert.Equal(original.Header.Generation, refreshed.Header.Generation);
+    }
+
+    [Fact]
+    public async Task BuildAsync_WithNoPreviousGeneration_StartsAtZero()
+    {
+        InMemorySourceProvider source = new(new Dictionary<string, string>
+        {
+            ["src/A.cs"] = MakeFile("Acme.A", "Widget", "DoA"),
+        });
+        IndexBuilder builder = CreateBuilder(source, new StubEmbeddingClient(), out _);
+
+        IndexSnapshot snapshot = await builder.BuildAsync(TestContext.Current.CancellationToken);
+
+        Assert.Equal(0, snapshot.Header.Generation);
+    }
+
+    [Fact]
     public async Task RefreshAsync_RebuildsFullyWhenTheStoredModelDiffersFromCurrent()
     {
         InMemorySourceProvider source = new(new Dictionary<string, string>
@@ -156,7 +297,10 @@ public sealed class IndexBuilderTests : IDisposable
         IndexBuilder builder = CreateBuilder(source, embedder, out IndexStore store);
         IndexSnapshot original = await builder.BuildAsync(TestContext.Current.CancellationToken);
 
-        IndexSnapshot doctored = original with { Header = original.Header with { Model = "some-other-model" } };
+        IndexSnapshot doctored = original with
+        {
+            Header = original.Header with { Model = "some-other-model", Generation = 5 },
+        };
         await store.SaveAsync(doctored, TestContext.Current.CancellationToken);
 
         int totalBefore = embedder.TotalInputs;
@@ -167,6 +311,12 @@ public sealed class IndexBuilderTests : IDisposable
         Assert.Equal(totalBefore + original.Chunks.Count, embedder.TotalInputs);
         Assert.Equal(embedder.Model, refreshed.Header.Model);
         Assert.Equal(original.Chunks.Count, refreshed.Chunks.Count);
+
+        // Even though this is a from-scratch rebuild, the on-disk header's generation was still
+        // readable (the load itself succeeded; only the model/dimensions check failed), so the
+        // rebuilt index's generation continues from it rather than coincidentally resetting to a
+        // value an outstanding id might already carry.
+        Assert.Equal(6, refreshed.Header.Generation);
     }
 
     [Fact]

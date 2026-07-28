@@ -3,63 +3,97 @@ using System.Globalization;
 namespace CodeIndex.Core.Search;
 
 /// <summary>
-/// A chunk id as exposed across the multi-project tool boundary: the owning project's id plus
-/// the chunk's ordinal position within that project's current snapshot, formatted as a single
-/// opaque string (<c>"{ProjectId}:{ChunkId}"</c>, e.g. <c>"xrpl:4137"</c>).
+/// A chunk id as exposed across the multi-project tool boundary: the owning project's id, the
+/// index generation the ordinal was captured against, and the chunk's ordinal position within
+/// that project's snapshot at that generation, formatted as a single opaque string
+/// (<c>"{ProjectId}:{Generation}:{ChunkId}"</c>, e.g. <c>"xrpl:3:4137"</c>).
 /// </summary>
 /// <remarks>
+/// <para>
 /// A plain ordinal (what <see cref="CodeIndexService"/> uses internally) is unambiguous only
-/// within one project's index — see the ordinal-id volatility warning on
-/// <see cref="Storage.IndexSnapshot"/>. With more than one project configured, the same ordinal
-/// can legitimately exist in several projects at once, so a caller-facing id must carry which
-/// project it came from. A single string (rather than a separate "project" field the caller would
-/// have to remember to pass alongside a bare ordinal) is what lets <c>code_get_chunk</c> be called
-/// with exactly what <c>code_search</c> returned, with no assembly required by the caller.
+/// within one project's index at one particular shape of its chunk list — see the ordinal-id
+/// volatility warning on <see cref="Storage.IndexSnapshot"/>. It does not survive a refresh that
+/// adds, removes, or reorders chunks: the same ordinal can end up pointing at a completely
+/// different declaration afterwards, with nothing about the id itself hinting that anything
+/// changed. <see cref="Storage.IndexHeader.Generation"/> exists precisely to make that detectable:
+/// carrying it as part of the id lets <see cref="CodeIndexService.GetChunkAsync"/> compare the
+/// generation the caller captured against the project's current one and refuse a mismatch outright
+/// (see <see cref="StaleChunkIdException"/>), instead of silently resolving a stale ordinal against
+/// whatever chunk now happens to occupy that slot.
+/// </para>
+/// <para>
 /// <see cref="ProjectOptions.ValidateId"/> rejects <c>':'</c> in a project id specifically so this
 /// format stays unambiguous to parse.
+/// </para>
 /// </remarks>
-public readonly record struct ProjectChunkId(string ProjectId, int ChunkId)
+public readonly record struct ProjectChunkId(string ProjectId, int Generation, int ChunkId)
 {
-    public override string ToString() => $"{ProjectId}:{ChunkId}";
+    public override string ToString() => $"{ProjectId}:{Generation}:{ChunkId}";
 
     /// <summary>
-    /// Parses <c>"{ProjectId}:{ChunkId}"</c>. Fails (returns <see langword="false"/>, never
-    /// throws) for anything else — a missing/misplaced separator, an empty project id, or a
-    /// non-integer/negative chunk ordinal — so callers can turn a malformed id into a clear,
-    /// user-facing error message instead of an exception.
+    /// Parses <c>"{ProjectId}:{Generation}:{ChunkId}"</c>. Fails (returns <see
+    /// langword="false"/>, never throws) for anything else — including the pre-generation,
+    /// two-part <c>"{ProjectId}:{ChunkId}"</c> format this server used to emit — so callers can
+    /// turn a malformed or outdated id into a clear, user-facing error message instead of an
+    /// exception or a silent misparse.
     /// </summary>
     /// <remarks>
-    /// Splits on the <em>last</em> <c>':'</c>, not the first: a chunk ordinal is always a plain
-    /// non-negative integer that can never itself contain a colon, so treating everything after
-    /// the final colon as the ordinal and everything before it as the project id parses correctly
-    /// even in the (already-rejected-at-config-time, see <see cref="ProjectOptions.ValidateId"/>)
-    /// hypothetical case of a project id that itself contains one.
+    /// <para>
+    /// Splits from the <em>right</em>, twice: the last <c>':'</c> separates the ordinal, and the
+    /// next one back separates the generation, because neither a chunk ordinal nor a generation
+    /// counter can ever itself contain a colon (both are plain non-negative integers), whereas a
+    /// project id is only guaranteed not to contain one by convention (see
+    /// <see cref="ProjectOptions.ValidateId"/>), not by this method's own parsing. Everything
+    /// before the second-to-last colon is taken as the project id, however many colons it happens
+    /// to contain.
+    /// </para>
+    /// <para>
+    /// A string with only one colon at all (the old two-part format, or something unrelated
+    /// entirely) has no second-to-last colon to split on and is rejected outright here — it is
+    /// never misread as, say, an empty generation or an empty project id.
+    /// </para>
     /// </remarks>
     public static bool TryParse(string? value, out ProjectChunkId result)
     {
+        result = default;
+
         if (value is null)
         {
-            result = default;
             return false;
         }
 
-        int separatorIndex = value.LastIndexOf(':');
-        if (separatorIndex <= 0 || separatorIndex == value.Length - 1)
+        int lastColon = value.LastIndexOf(':');
+        if (lastColon <= 0 || lastColon == value.Length - 1)
         {
-            result = default;
             return false;
         }
 
-        string projectId = value[..separatorIndex];
-        string chunkIdPart = value[(separatorIndex + 1)..];
+        string chunkIdPart = value[(lastColon + 1)..];
+        string beforeChunkId = value[..lastColon];
+
+        int secondLastColon = beforeChunkId.LastIndexOf(':');
+        if (secondLastColon <= 0 || secondLastColon == beforeChunkId.Length - 1)
+        {
+            // Missing the generation segment entirely: either the legacy "<project>:<ordinal>"
+            // format from before generations existed, or something not shaped like a chunk id at
+            // all. Either way, there is nothing sound to fall back to — reject rather than guess.
+            return false;
+        }
 
         if (!int.TryParse(chunkIdPart, NumberStyles.None, CultureInfo.InvariantCulture, out int chunkId))
         {
-            result = default;
             return false;
         }
 
-        result = new ProjectChunkId(projectId, chunkId);
+        string projectId = beforeChunkId[..secondLastColon];
+        string generationPart = beforeChunkId[(secondLastColon + 1)..];
+
+        if (!int.TryParse(generationPart, NumberStyles.None, CultureInfo.InvariantCulture, out int generation))
+        {
+            return false;
+        }
+
+        result = new ProjectChunkId(projectId, generation, chunkId);
         return true;
     }
 }

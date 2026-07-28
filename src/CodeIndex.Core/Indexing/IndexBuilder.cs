@@ -70,7 +70,18 @@ public sealed class IndexBuilder
     /// (which never persists it; see <see cref="CodeChunk.EmbedText"/>). Do not use a returned
     /// chunk's <see cref="CodeChunk.EmbedText"/> to re-embed it.
     /// </remarks>
-    public async Task<IndexSnapshot> BuildAsync(CancellationToken cancellationToken = default)
+    /// <param name="cancellationToken">Cancellation for every I/O and embedding call this makes.</param>
+    /// <param name="previousGeneration">
+    /// The <see cref="IndexHeader.Generation"/> of whatever index (if any) this build is
+    /// superseding, when the caller has one to offer — see each call site
+    /// (<see cref="RefreshAsync"/>'s fallback branches, <see cref="Search.CodeIndexService.RebuildAsync"/>)
+    /// for what "has one to offer" means in practice. The new snapshot's generation is always this
+    /// value plus one, or <c>0</c> when omitted: a full rebuild always produces a different chunk
+    /// list shape in general (it re-derives everything from scratch, it does not merely confirm
+    /// nothing changed the way the common refresh path does), so it must never reuse a generation
+    /// number an outstanding id might already be carrying.
+    /// </param>
+    public async Task<IndexSnapshot> BuildAsync(CancellationToken cancellationToken = default, int? previousGeneration = null)
     {
         List<string> paths = await EnumerateSortedPathsAsync(cancellationToken).ConfigureAwait(false);
 
@@ -104,6 +115,7 @@ public sealed class IndexBuilder
                 Dimensions = _embeddingClient.Dimensions,
                 ChunkCount = chunks.Count,
                 BuiltAtUtc = DateTime.UtcNow,
+                Generation = (previousGeneration ?? -1) + 1,
             },
             Chunks = chunks,
             Fingerprints = fingerprints,
@@ -173,6 +185,10 @@ public sealed class IndexBuilder
             }
             catch (IndexCorruptedException)
             {
+                // A corrupted manifest cannot be trusted for anything, including whatever
+                // generation number it claimed — starting the rebuild's generation fresh at 0 is
+                // no less sound than trusting a number that came from a file already known to be
+                // unreliable.
                 _indexStore.Delete();
                 return await BuildAsync(cancellationToken).ConfigureAwait(false);
             }
@@ -180,7 +196,12 @@ public sealed class IndexBuilder
 
         if (stored is null || !stored.Header.IsCompatibleWith(_embeddingClient.Model, _embeddingClient.Dimensions))
         {
-            return await BuildAsync(cancellationToken).ConfigureAwait(false);
+            // `stored` was loaded successfully here (it is only null when nothing was ever
+            // built), so its Generation is trustworthy even though the rest of it — model,
+            // dimensions — is being discarded: passing it through means an id captured against
+            // the old model's index still correctly reads as stale afterwards instead of
+            // coincidentally matching a fresh rebuild that reset back to 0.
+            return await BuildAsync(cancellationToken, stored?.Header.Generation).ConfigureAwait(false);
         }
 
         Dictionary<string, FileFingerprint> fingerprintByPath = new(StringComparer.Ordinal);
@@ -456,13 +477,67 @@ public sealed class IndexBuilder
             vector.AsSpan().CopyTo(flatVectors.AsSpan(destOffset * dimensions, dimensions));
         }
 
+        int generation = HasChunkListShapeChanged(stored.Chunks, finalChunks)
+            ? stored.Header.Generation + 1
+            : stored.Header.Generation;
+
         return new IndexSnapshot
         {
-            Header = stored.Header with { ChunkCount = finalChunks.Count, BuiltAtUtc = DateTime.UtcNow },
+            Header = stored.Header with { ChunkCount = finalChunks.Count, BuiltAtUtc = DateTime.UtcNow, Generation = generation },
             Chunks = finalChunks,
             Fingerprints = finalFingerprints,
             Vectors = flatVectors,
         };
+    }
+
+    /// <summary>
+    /// Whether an ordinal id captured against <paramref name="previous"/> could possibly resolve
+    /// to a different chunk than the one it named when read against <paramref name="updated"/> —
+    /// the condition <see cref="IndexHeader.Generation"/> exists to flag. Compares the two chunk
+    /// lists' <em>shape</em> — the ordered sequence of (file path, chunk count) pairs, exploiting
+    /// the invariant that <see cref="Assemble"/> always lays chunks out contiguously per file in
+    /// ordinal path order (see the class remarks) — rather than every chunk's full content.
+    /// </summary>
+    /// <remarks>
+    /// <para>
+    /// This is deliberately more permissive than "the two lists are not exactly equal": a file
+    /// whose content changed but whose member count did not (e.g. a method body edited without
+    /// adding or removing a member) re-chunks to a different <see cref="CodeChunk.Signature"/>/
+    /// <see cref="CodeChunk.DocComment"/>/line range at the very same ordinal — that chunk's own id
+    /// still names the same declaration, just with updated content, exactly what a caller wants
+    /// <see cref="Search.CodeIndexService.GetChunkAsync"/> to hand back. Only a change that could
+    /// shift some <em>other</em> chunk's ordinal — a file added, removed, or re-chunked to a
+    /// different chunk count — needs to invalidate outstanding ids, and that is exactly what a
+    /// changed (path, count) shape captures.
+    /// </para>
+    /// <para>
+    /// Runs in <c>O(chunks)</c> over both lists, but only on the path that already does at least
+    /// that much work reassembling the chunk list in the first place (see <see cref="RefreshAsync"/>'s
+    /// no-op fast path, which returns before ever calling <see cref="Assemble"/> and therefore
+    /// before ever calling this).
+    /// </para>
+    /// </remarks>
+    private static bool HasChunkListShapeChanged(IReadOnlyList<CodeChunk> previous, IReadOnlyList<CodeChunk> updated) =>
+        !GroupByFileRun(previous).SequenceEqual(GroupByFileRun(updated));
+
+    /// <summary>Groups a chunk list — assumed already laid out contiguously per file (see the
+    /// class remarks) — into an ordered sequence of (file path, run length) pairs.</summary>
+    private static IEnumerable<(string Path, int Count)> GroupByFileRun(IReadOnlyList<CodeChunk> chunks)
+    {
+        int i = 0;
+        while (i < chunks.Count)
+        {
+            string path = chunks[i].FilePath;
+            int start = i;
+
+            do
+            {
+                i++;
+            }
+            while (i < chunks.Count && string.Equals(chunks[i].FilePath, path, StringComparison.Ordinal));
+
+            yield return (path, i - start);
+        }
     }
 
     private async Task<List<string>> EnumerateSortedPathsAsync(CancellationToken cancellationToken)
