@@ -6,9 +6,9 @@ namespace CodeIndex.Core.Tests.Search;
 
 public sealed class SymbolMatcherTests
 {
-    private static CodeChunk Chunk(string symbol, string signature = "") => new()
+    private static CodeChunk Chunk(string symbol, string signature = "", string filePath = "f.cs") => new()
     {
-        FilePath = "f.cs",
+        FilePath = filePath,
         StartLine = 1,
         EndLine = 2,
         Kind = ChunkKind.Method,
@@ -99,6 +99,97 @@ public sealed class SymbolMatcherTests
 
         Assert.Equal(chunks.Count, hits.Count);
         for (int i = 0; i < chunks.Count; i++)
+            Assert.Equal(i, hits[i].Index);
+    }
+
+    /// <summary>
+    /// A chunk whose directory matches the query (and whose symbol/signature do not) must still
+    /// score strictly below a chunk that matches only via <see cref="CodeChunk.Signature"/> —
+    /// path is the weakest of the three bands.
+    /// </summary>
+    [Fact]
+    public void Match_ScoresPathOnlyMatchBelowSignatureOnlyMatch()
+    {
+        List<CodeChunk> chunks =
+        [
+            Chunk("A.B.Unrelated", filePath: "Xrpl.AddressCodec/Helper.cs"), // path-only match
+            Chunk("A.B.Run", "Task<AddressCodecResult> Run()"), // signature-only match
+        ];
+        SymbolMatcher matcher = new(chunks);
+
+        IReadOnlyList<ScoredIndex> hits = matcher.Match("AddressCodec", topK: 10);
+
+        Assert.Equal(2, hits.Count);
+        Assert.Equal(1, hits[0].Index); // signature match ranks first
+        Assert.Equal(0, hits[1].Index); // path-only match ranks last, but is still returned
+    }
+
+    /// <summary>A path-only match is still a match: it must rank above a chunk with no match at
+    /// all rather than being dropped as noise.</summary>
+    [Fact]
+    public void Match_RanksPathOnlyMatchAboveNoMatchAtAll()
+    {
+        List<CodeChunk> chunks =
+        [
+            Chunk("A.B.Unrelated", filePath: "Xrpl.AddressCodec/Helper.cs"), // path-only match
+            Chunk("A.B.SomethingElseEntirely"), // no match on any band
+        ];
+        SymbolMatcher matcher = new(chunks);
+
+        IReadOnlyList<ScoredIndex> hits = matcher.Match("AddressCodec", topK: 10);
+
+        Assert.Single(hits);
+        Assert.Equal(0, hits[0].Index);
+    }
+
+    /// <summary>
+    /// The path band consults only the chunk's containing directory, not its file name: a query
+    /// that matches the file name alone (but not the directory, symbol, or signature) must not
+    /// match at all. This is a deliberate scoping decision (see <see cref="SymbolMatcher"/>'s own
+    /// remarks on <c>PathScore</c>) — including the file name let an unrelated sibling
+    /// declaration in the same file ride along on a strong match's coattails and regressed a
+    /// real golden query, so only the directory counts.
+    /// </summary>
+    [Fact]
+    public void Match_ConsultsOnlyTheDirectoryNotTheFileName()
+    {
+        List<CodeChunk> chunks =
+        [
+            Chunk("A.B.Unrelated", filePath: "src/Models/TrustSetFlags.cs"), // file name matches, directory does not
+            Chunk("A.B.AlsoUnrelated", filePath: "src/TrustSet/Models.cs"), // directory matches
+        ];
+        SymbolMatcher matcher = new(chunks);
+
+        IReadOnlyList<ScoredIndex> hits = matcher.Match("TrustSet", topK: 10);
+
+        Assert.Single(hits);
+        Assert.Equal(1, hits[0].Index);
+    }
+
+    /// <summary>
+    /// A directory match is shared by every file underneath it, so a single generically-named
+    /// directory can otherwise flood the branch with hundreds of equally-scored, largely
+    /// unrelated chunks (measured against a real 8,897-chunk index: querying the name of one
+    /// 1,825-chunk directory picked up 466 such chunks). <see cref="SymbolMatcher"/> caps how
+    /// many chunks may score via the path band alone per <see cref="SymbolMatcher.Match"/> call;
+    /// this pins that cap at 20 and confirms it is enforced in ascending chunk-index order, the
+    /// same deterministic tie-break used everywhere else in this class.
+    /// </summary>
+    [Fact]
+    public void Match_CapsPathOnlyMatchesAndKeepsTheLowestIndicesFirst()
+    {
+        const int PathOnlyMatchCap = 20;
+        List<CodeChunk> chunks =
+        [
+            .. Enumerable.Range(0, PathOnlyMatchCap + 5)
+                .Select(i => Chunk($"A.B.Unrelated{i}", filePath: "Xrpl.AddressCodec/Helper.cs")),
+        ];
+        SymbolMatcher matcher = new(chunks);
+
+        IReadOnlyList<ScoredIndex> hits = matcher.Match("AddressCodec", topK: 100);
+
+        Assert.Equal(PathOnlyMatchCap, hits.Count);
+        for (int i = 0; i < PathOnlyMatchCap; i++)
             Assert.Equal(i, hits[i].Index);
     }
 }
