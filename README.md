@@ -560,3 +560,7 @@ implementation plan. Run the test suite with:
 ```bash
 dotnet test
 ```
+
+## License
+
+[MIT](LICENSE) © Aleksandr Platonenkov
