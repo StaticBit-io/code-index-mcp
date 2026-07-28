@@ -1,5 +1,7 @@
 # code-index-mcp
 
+[![CI](https://github.com/StaticBit-io/code-index-mcp/actions/workflows/ci.yml/badge.svg)](https://github.com/StaticBit-io/code-index-mcp/actions/workflows/ci.yml)
+
 A local MCP (Model Context Protocol) server that gives Claude Code semantic search over one or
 more C# codebases, backed by a vector index built from locally computed embeddings. It exposes
 four tools over stdio: `code_search`, `code_get_chunk`, `code_index_status`, and `code_reindex` —
