@@ -304,12 +304,24 @@ public sealed class VectorSearcherTests
         Assert.Equal(topK, hits.Count);
         Assert.Equal(reference, hits);
 
-        // A full brute-force scan at this scale is expected within a few milliseconds in
-        // Release and not much more under a Debug test host; 50 ms leaves headroom for a slow
-        // CI run without being so wide it would fail to catch a real performance regression.
+        // The bound is relative, not absolute. An absolute millisecond threshold cannot work
+        // on a shared CI runner: the same search measured 1.6 ms locally and 3 s on a hosted
+        // Windows agent, a 2000x spread caused by virtualisation and noisy neighbours, not by
+        // any regression. Comparing against a full sort of the same data on the same machine
+        // in the same run cancels that out — both paths pay the identical environment tax.
+        //
+        // The claim under test is that the bounded heap is not slower than sorting everything,
+        // which is the entire justification for its extra complexity. Locally that ratio is
+        // about 0.65; the 1.5x ceiling tolerates measurement noise while still failing loudly
+        // if selection ever degrades into something worse than the naive approach.
+        double ratio = heapMs / fullSortMs;
+
+        _output.WriteLine($"Heap/full-sort ratio: {ratio:F3} (lower is better).");
+
         Assert.True(
-            heapMs < 50,
-            $"Search took {heapMs:F3} ms, expected under 50 ms.");
+            ratio < 1.5,
+            $"Bounded-heap selection took {heapMs:F3} ms against {fullSortMs:F3} ms for a full sort " +
+            $"(ratio {ratio:F3}). The heap is meant to be no slower than sorting everything.");
     }
 
     private static ScoredIndex[] FullSortReferenceSearch(float[] vectors, int dimensions, float[] query, int topK)
