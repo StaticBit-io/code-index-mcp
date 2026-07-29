@@ -397,8 +397,14 @@ public sealed class CodeIndexService
                 fingerprintByPath.GetValueOrDefault(chunk.FilePath), chunk.FilePath, cancellationToken);
         }
 
-        string[] excerpts = await Task.WhenAll(excerptTasks).ConfigureAwait(false);
-        bool[] staleFlags = await Task.WhenAll(stalenessTasks).ConfigureAwait(false);
+        // Awaited together, not one after the other: awaiting excerptTasks alone first would
+        // leave stalenessTasks unobserved (and their exceptions unobserved) if excerptTasks faults
+        // or the caller's cancellationToken fires first.
+        Task<string[]> excerptsTask = Task.WhenAll(excerptTasks);
+        Task<bool[]> stalenessTask = Task.WhenAll(stalenessTasks);
+        await Task.WhenAll(excerptsTask, stalenessTask).ConfigureAwait(false);
+        string[] excerpts = excerptsTask.Result;
+        bool[] staleFlags = stalenessTask.Result;
 
         List<SearchHit> hits = new(fused.Count);
         for (int i = 0; i < fused.Count; i++)
