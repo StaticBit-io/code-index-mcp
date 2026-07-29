@@ -1,0 +1,15 @@
+{
+  "CodeIndex": {
+    "Projects": [
+      {
+        "Id": "myproject",
+        "Root": "/path/to/MyProject"
+      },
+      {
+        "Id": "otherproject",
+        "Root": "/path/to/OtherProject",
+        "Extensions": [ ".cs" ]
+      }
+    ]
+  }
+}

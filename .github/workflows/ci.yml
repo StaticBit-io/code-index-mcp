@@ -1,0 +1,80 @@
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  build-and-test:
+    name: Build & Test (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [windows-latest, ubuntu-latest]
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - name: Setup .NET
+        uses: actions/setup-dotnet@v4
+        with:
+          global-json-file: global.json
+
+      - name: Restore
+        shell: bash
+        run: dotnet restore CodeIndexMcp.slnx
+
+      - name: Build
+        shell: bash
+        run: dotnet build CodeIndexMcp.slnx -c Release --no-restore
+
+      - name: Test
+        shell: bash
+        run: >
+          dotnet test CodeIndexMcp.slnx -c Release --no-build
+          --logger "trx"
+          --results-directory ./TestResults
+
+      # Runs even when the Test step above fails, so a red run still reports how many tests
+      # ran/passed/failed instead of forcing a reader to open the raw logs. Parsed straight out
+      # of the TRX <Counters/> element rather than dotnet test's console line so it does not
+      # depend on the runner's locale.
+      - name: Test summary
+        if: always()
+        shell: bash
+        run: |
+          set -uo pipefail
+          shopt -s nullglob
+
+          total=0
+          passed=0
+          failed=0
+
+          for f in ./TestResults/*.trx; do
+            counters=$(grep -o '<Counters[^/]*/>' "$f")
+            t=$(echo "$counters" | grep -o 'total="[0-9]*"' | grep -o '[0-9]*')
+            p=$(echo "$counters" | grep -o 'passed="[0-9]*"' | grep -o '[0-9]*')
+            fa=$(echo "$counters" | grep -o 'failed="[0-9]*"' | grep -o '[0-9]*')
+            total=$((total + ${t:-0}))
+            passed=$((passed + ${p:-0}))
+            failed=$((failed + ${fa:-0}))
+          done
+
+          {
+            echo "### Test results — ${{ matrix.os }}"
+            echo ""
+            echo "| Total | Passed | Failed |"
+            echo "|------:|-------:|-------:|"
+            echo "| $total | $passed | $failed |"
+          } >> "$GITHUB_STEP_SUMMARY"

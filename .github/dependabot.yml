@@ -1,0 +1,18 @@
+version: 2
+updates:
+  # NuGet packages are centrally managed in Directory.Packages.props (see that file). Several
+  # were already behind at the time this was added, and Directory.Build.props treats vulnerability
+  # advisories at High/Critical severity (NU1903/NU1904) as build errors (Low/Moderate are
+  # excluded via WarningsNotAsErrors). That is deliberate: an unattended Dependabot bump that lands
+  # on a version with a known high/critical advisory will fail CI loudly on this PR instead of
+  # silently merging a vulnerable dependency. Treat a red Dependabot PR here as "advisory found",
+  # not as a broken workflow.
+  - package-ecosystem: "nuget"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+
+  - package-ecosystem: "github-actions"
+    directory: "/"
+    schedule:
+      interval: "weekly"

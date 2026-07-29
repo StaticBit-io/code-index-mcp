@@ -1,0 +1,18 @@
+<Project>
+  <PropertyGroup>
+    <TargetFramework>net10.0</TargetFramework>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <Nullable>enable</Nullable>
+    <LangVersion>latest</LangVersion>
+    <TreatWarningsAsErrors>true</TreatWarningsAsErrors>
+    <EnforceCodeStyleInBuild>true</EnforceCodeStyleInBuild>
+    <!-- Enabled so IDE0005 (unused usings) actually reports; documenting every public
+         member is not a project goal, hence CS1591 is suppressed. -->
+    <GenerateDocumentationFile>true</GenerateDocumentationFile>
+    <NoWarn>$(NoWarn);CS1591</NoWarn>
+    <!-- Only low (NU1901) and moderate (NU1902) advisory severities are excluded from
+         TreatWarningsAsErrors, so unrelated low-risk advisories do not break local builds.
+         High (NU1903) and critical (NU1904) advisories must still fail the build. -->
+    <WarningsNotAsErrors>NU1901;NU1902</WarningsNotAsErrors>
+  </PropertyGroup>
+</Project>
