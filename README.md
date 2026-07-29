@@ -40,7 +40,45 @@ By default, `.cs`, `.razor`, and `.md` files are indexed — see
 [Which files get indexed](#which-files-get-indexed) below for how chunking differs by extension
 and how to configure a different set per project.
 
-## Setup
+## Install as a Claude Code plugin (recommended)
+
+The easiest way to run this server is as a Claude Code plugin — it bundles a prebuilt, portable
+server binary plus a launcher that checks every prerequisite above (`.NET` runtime, Ollama
+reachable, model pulled, at least one project configured) and fails with an actionable message
+instead of a stack trace or a silent hang:
+
+```
+/plugin marketplace add StaticBit-io/code-index-mcp
+/plugin install code-index@code-index-mcp
+```
+
+Then create `~/.code-index-mcp/config.json` with the project(s) you want indexed:
+
+```json
+{
+  "CodeIndex": {
+    "Projects": [
+      { "Id": "myproject", "Root": "/path/to/MyProject" }
+    ]
+  }
+}
+```
+
+Full plugin documentation — configuration precedence, first-run expectations (the first search
+against a freshly configured project takes minutes while the index builds from scratch), and the
+exact troubleshooting messages for each missing prerequisite — lives in
+[`plugins/code-index/README.md`](plugins/code-index/README.md)
+([Русский](plugins/code-index/README.ru.md)).
+
+Building/updating the plugin's own binary from source (needed only if you're contributing to this
+repo, not for normal use): `dotnet publish src/CodeIndex.Server -c Release -o
+plugins/code-index/bin/server`.
+
+## Manual setup (build from source)
+
+Use this path if you'd rather run the server directly from a source checkout (development on
+this repo, or a platform the committed plugin binary wasn't built for — see
+[Platforms](plugins/code-index/README.md#platforms)) instead of installing the plugin above.
 
 1. **Install Ollama** and make sure it's running:
    ```bash
@@ -129,7 +167,9 @@ and how to configure a different set per project.
    ```
    This prints, for every configured project, file/chunk counts, cache location and size, and a
    live refresh + search round trip.
-7. **Register the server with Claude Code** — see [Registering with Claude Code](#registering-with-claude-code) below.
+7. **Register the server with Claude Code** — see
+   [Registering with Claude Code (manual fallback)](#registering-with-claude-code-manual-fallback)
+   below.
 
 ## The four tools
 
@@ -391,7 +431,10 @@ There's no automated sync between machines — the source is already synced via 
 benefit of automating a 37 MB copy or a several-minute rebuild is smaller than the cost of
 building and maintaining that automation.
 
-## Registering with Claude Code
+## Registering with Claude Code (manual fallback)
+
+If you followed [Install as a Claude Code plugin](#install-as-a-claude-code-plugin-recommended)
+above, this step is already done — skip it. This section is only for the manual setup path.
 
 Register the server using the **built Release binary**, not `dotnet run` — `dotnet run` re-checks
 whether a build is needed on every launch, which adds a delay to every server start for no
