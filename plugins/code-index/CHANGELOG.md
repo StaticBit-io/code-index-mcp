@@ -2,6 +2,32 @@
 
 All notable changes to this plugin are listed here. Newest at the top.
 
+## v0.1.3 — 2026-07-29
+
+### Documentation
+- benchmarked four lighter alternatives to the default `qwen3-embedding:4b`
+  (`qwen3-embedding:0.6b`, `nomic-embed-text`, `mxbai-embed-large`,
+  `all-minilm`) against the same corpus, so someone on weaker hardware can
+  pick with numbers instead of guessing. Added a comparison table to the
+  repository README (VRAM, download size, dimensions, index time, cache
+  size, warm query latency, reference-query accuracy, and a re-derived
+  `MinCosineSimilarity` per model) and pointed this plugin's Prerequisites
+  section at it.
+
+### Fixes
+- `Embedding:QueryInstruction` was hardcoded into an
+  `"Instruct: {QueryInstruction}\nQuery: {query}"` template, so no
+  configured value could ever produce the correct prefix for a model that
+  does not use Qwen's instruction format (e.g. `nomic-embed-text`'s
+  `"search_query: "`). It is now a raw prefix, prepended verbatim; the
+  default value is unchanged in effect (produces the identical embedded
+  string for the default model), but the setting can now actually be
+  pointed at a different model family.
+
+### Internal
+- rebuilt the bundled `bin/server/` binary from source to pick up the
+  `QueryInstruction` fix above.
+
 ## v0.1.2 — 2026-07-29
 
 ### Documentation
