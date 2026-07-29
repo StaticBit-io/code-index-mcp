@@ -47,7 +47,7 @@ server binary plus a launcher that checks every prerequisite above (`.NET` runti
 reachable, model pulled, at least one project configured) and fails with an actionable message
 instead of a stack trace or a silent hang:
 
-```
+```text
 /plugin marketplace add StaticBit-io/code-index-mcp
 /plugin install code-index@code-index-mcp
 ```
@@ -292,7 +292,7 @@ unrelated seven-chunk project about cooking took **4 of 8** merged slots for the
 validate trustline deletion", because its best (and only) candidate's cosine similarity of `0.071`
 fused to the identical RRF score as the real index's `0.9525` match — RRF never saw either number,
 only "rank 1 in a branch of size N." `Embedding:MinCosineSimilarity` (see
-[Setup](#setup) and `EmbeddingOptions.MinCosineSimilarity`'s own remarks for how its `0.55` default
+[Setup](#manual-setup-build-from-source) and `EmbeddingOptions.MinCosineSimilarity`'s own remarks for how its `0.55` default
 was measured) closes that gap: a candidate is excluded before it can receive a rank at all once its
 cosine similarity falls below the configured floor, so a project with nothing relevant contributes
 zero vector hits — not one disguised as "rank 1" — and the rank-only comparability claim above is
@@ -451,7 +451,7 @@ need to change.
 
 ## Which files get indexed
 
-Each project's `Extensions` list (see [Setup](#setup), step 4) controls which files it walks —
+Each project's `Extensions` list (see [Setup](#manual-setup-build-from-source), step 4) controls which files it walks —
 `[".cs", ".razor", ".md"]` by default. Which chunker a file goes through is decided by its
 extension, not by trial and error:
 

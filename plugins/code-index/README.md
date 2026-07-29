@@ -27,7 +27,7 @@ launcher checks all of them before starting the server and tells you exactly wha
 
 ## Install
 
-```
+```text
 /plugin marketplace add StaticBit-io/code-index-mcp
 /plugin install code-index@code-index-mcp
 ```
@@ -50,7 +50,7 @@ with the project(s) you want indexed:
 ```
 
 This is the same shape as the server's own `CodeIndex`/`Embedding` configuration (see the
-[repository README](../../README.md#setup)) — `Id` is the cache key, `Root` is the absolute path
+[repository README](../../README.md#manual-setup-build-from-source)) — `Id` is the cache key, `Root` is the absolute path
 to the repository, and an optional `Extensions` list narrows or widens which files get indexed
 per project. Add more entries to index several repositories from one server:
 
@@ -76,7 +76,7 @@ per project. Add more entries to index several repositories from one server:
 Expressing several projects purely through environment variables means one clunky, indexed
 variable per field:
 
-```
+```bash
 CODEINDEX_CodeIndex__Projects__0__Id=myproject
 CODEINDEX_CodeIndex__Projects__0__Root=/path/to/MyProject
 ```
@@ -112,13 +112,13 @@ rather than assuming something is stuck.
 
 ## Verify it works
 
-```
+```text
 /mcp
 ```
 
 Should show `code-index: connected, 4 tools`. Then try:
 
-```
+```text
 Search this codebase for where trustline deletion is validated.
 ```
 
@@ -130,7 +130,7 @@ The launcher (`bin/server.js`) checks the following before the server ever start
 of these to stderr instead of a stack trace or a silent hang:
 
 **No project configured:**
-```
+```text
 [code-index] No project is configured — there is nothing to search yet.
 
 [code-index] Create <path>\.code-index-mcp\config.json with at least one project:
@@ -143,13 +143,11 @@ of these to stderr instead of a stack trace or a silent hang:
     }
   }
 
-[code-index] (Or set CODEINDEX_CodeIndex__Projects__0__Id / __Root as environment variables — see the plugin README for the full precedence rules.)
-
 [code-index] Then restart Claude Code so the server picks up the new configuration.
 ```
 
 **Ollama not running:**
-```
+```text
 [code-index] Cannot reach Ollama at http://localhost:11434.
 
 [code-index] code-index-mcp needs Ollama running locally to compute embeddings.
@@ -161,7 +159,7 @@ of these to stderr instead of a stack trace or a silent hang:
 ```
 
 **Model not pulled:**
-```
+```text
 [code-index] Ollama is running, but model 'qwen3-embedding:4b' is not pulled yet.
 
 [code-index] Pull it (about 2.5 GB, one-time download):

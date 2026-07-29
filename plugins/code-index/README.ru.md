@@ -28,7 +28,7 @@ C#-репозиториям. Запускает `CodeIndex.Server.dll` под **
 
 ## Установка
 
-```
+```text
 /plugin marketplace add StaticBit-io/code-index-mcp
 /plugin install code-index@code-index-mcp
 ```
@@ -51,7 +51,7 @@ C#-репозиториям. Запускает `CodeIndex.Server.dll` под **
 ```
 
 Это та же форма, что и собственная конфигурация сервера `CodeIndex`/`Embedding` (см.
-[README репозитория](../../README.md#setup)) — `Id` — это ключ кэша, `Root` — абсолютный путь к
+[README репозитория](../../README.md#manual-setup-build-from-source)) — `Id` — это ключ кэша, `Root` — абсолютный путь к
 репозиторию, а необязательный список `Extensions` сужает или расширяет набор индексируемых
 файлов для конкретного проекта. Добавьте больше записей, чтобы индексировать несколько
 репозиториев одним сервером:
@@ -78,7 +78,7 @@ C#-репозиториям. Запускает `CodeIndex.Server.dll` под **
 Если выражать несколько проектов только через переменные окружения, получится по одной
 громоздкой индексированной переменной на каждое поле:
 
-```
+```bash
 CODEINDEX_CodeIndex__Projects__0__Id=myproject
 CODEINDEX_CodeIndex__Projects__0__Root=/path/to/MyProject
 ```
@@ -117,13 +117,13 @@ endpoint или модель Ollama без правки файла.
 
 ## Проверка работы
 
-```
+```text
 /mcp
 ```
 
 Должно показать `code-index: connected, 4 tools`. Затем попробуйте:
 
-```
+```text
 Найди в этом репозитории, где проверяется удаление trustline.
 ```
 
@@ -135,7 +135,7 @@ endpoint или модель Ollama без правки файла.
 тихого зависания печатает в stderr одно из этих сообщений:
 
 **Проект не настроен:**
-```
+```text
 [code-index] No project is configured — there is nothing to search yet.
 
 [code-index] Create <path>\.code-index-mcp\config.json with at least one project:
@@ -148,13 +148,11 @@ endpoint или модель Ollama без правки файла.
     }
   }
 
-[code-index] (Or set CODEINDEX_CodeIndex__Projects__0__Id / __Root as environment variables — see the plugin README for the full precedence rules.)
-
 [code-index] Then restart Claude Code so the server picks up the new configuration.
 ```
 
 **Ollama не запущен:**
-```
+```text
 [code-index] Cannot reach Ollama at http://localhost:11434.
 
 [code-index] code-index-mcp needs Ollama running locally to compute embeddings.
@@ -166,7 +164,7 @@ endpoint или модель Ollama без правки файла.
 ```
 
 **Модель не скачана:**
-```
+```text
 [code-index] Ollama is running, but model 'qwen3-embedding:4b' is not pulled yet.
 
 [code-index] Pull it (about 2.5 GB, one-time download):
