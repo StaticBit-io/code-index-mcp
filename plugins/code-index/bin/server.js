@@ -89,13 +89,25 @@ function checkDotnetRuntime() {
 
 // ── Configuration resolution (config file + appsettings.json defaults) ──────
 
-/** Reads a JSON file, returning {} on any read/parse failure (never throws —
- * a malformed user config file is reported explicitly by the caller instead). */
+/** Reads a JSON file, returning {} when it simply doesn't exist (the normal
+ * case for an as-yet-unconfigured install). A file that exists but can't be
+ * read or doesn't parse as JSON is a real problem the user needs to see —
+ * silently treating it as {} would surface as the misleading "No project is
+ * configured" message instead of the actual cause, so those cases throw with
+ * the path and original error attached for the caller to report. */
 function readJsonSafe(filePath) {
+  let raw;
   try {
-    return JSON.parse(fs.readFileSync(filePath, 'utf8'));
-  } catch {
-    return {};
+    raw = fs.readFileSync(filePath, 'utf8');
+  } catch (err) {
+    if (err.code === 'ENOENT') return {};
+    throw new Error(`Could not read ${filePath}: ${err.message}`);
+  }
+
+  try {
+    return JSON.parse(raw);
+  } catch (err) {
+    throw new Error(`${filePath} is not valid JSON: ${err.message}`);
   }
 }
 
@@ -174,9 +186,6 @@ function checkProjectConfigured(env) {
     '      ]',
     '    }',
     '  }',
-    '',
-    '[code-index] (Or set CODEINDEX_CodeIndex__Projects__0__Id / __Root as environment ' +
-      'variables — see the plugin README for the full precedence rules.)',
     '',
     '[code-index] Then restart Claude Code so the server picks up the new configuration.',
   );
@@ -289,10 +298,24 @@ function runServer(env) {
 async function main() {
   if (!checkDotnetRuntime()) process.exit(2);
 
-  const env = buildChildEnv();
+  let env;
+  try {
+    env = buildChildEnv();
+  } catch (err) {
+    logError(`[code-index] ${err.message}`);
+    process.exit(2);
+  }
 
   if (!checkProjectConfigured(env)) process.exit(2);
-  if (!(await checkOllama(env))) process.exit(2);
+
+  let ollamaOk;
+  try {
+    ollamaOk = await checkOllama(env);
+  } catch (err) {
+    logError(`[code-index] ${err.message}`);
+    process.exit(2);
+  }
+  if (!ollamaOk) process.exit(2);
 
   runServer(env);
 }
