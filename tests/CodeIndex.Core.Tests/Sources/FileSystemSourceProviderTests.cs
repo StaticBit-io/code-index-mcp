@@ -221,6 +221,39 @@ public sealed class FileSystemSourceProviderTests : IDisposable
     }
 
     [Fact]
+    public async Task ReadTextAsync_SymlinkedFile_ThrowsRatherThanFollowingIt()
+    {
+        // EnumerateAsync already skips a symlinked entry entirely (see the test above), but
+        // ReadTextAsync/ReadLinesAsync/StatAsync run in a separate, later pass over paths
+        // EnumerateAsync already yielded (see IndexBuilder.BuildAsync) — Resolve() must reject a
+        // reparse point on its own, independently, or a symlink swapped in between the two passes
+        // would be followed on read despite never being enumerated.
+        string secretFile = Path.Combine(Path.GetTempPath(), "ci-secret-" + Guid.NewGuid().ToString("N") + ".txt");
+        File.WriteAllText(secretFile, "-----BEGIN OPENSSH PRIVATE KEY-----");
+        string linkPath = Path.Combine(_root, "src", "Config.cs");
+
+        try
+        {
+            if (!TryCreateFileSymlink(linkPath, secretFile))
+            {
+                Assert.Skip("This environment cannot create file symlinks (needs Developer Mode " +
+                    "or elevation on Windows); the containment logic is still exercised on CI.");
+                return;
+            }
+
+            FileSystemSourceProvider provider = new(_root);
+
+            await Assert.ThrowsAsync<UnauthorizedAccessException>(
+                () => provider.ReadTextAsync("src/Config.cs", TestContext.Current.CancellationToken));
+        }
+        finally
+        {
+            SafeDeleteLink(linkPath);
+            File.Delete(secretFile);
+        }
+    }
+
+    [Fact]
     public async Task EnumerateAsync_SkipsSymlinkedDirectory_NeverDescendingIntoIt()
     {
         string secretDirectory = Path.Combine(Path.GetTempPath(), "ci-secret-dir-" + Guid.NewGuid().ToString("N"));
@@ -304,7 +337,7 @@ public sealed class FileSystemSourceProviderTests : IDisposable
             else if (Directory.Exists(linkPath))
                 Directory.Delete(linkPath);
         }
-        catch (IOException)
+        catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
         {
             // Best-effort cleanup; the containing _root gets torn down by Dispose() regardless.
         }
@@ -354,7 +387,15 @@ public sealed class FileSystemSourceProviderTests : IDisposable
         };
 
         using Process? process = Process.Start(startInfo);
-        process?.WaitForExit();
-        return process is { ExitCode: 0 };
+        if (process is null)
+            return false;
+
+        if (!process.WaitForExit(TimeSpan.FromSeconds(30)))
+        {
+            process.Kill(entireProcessTree: true);
+            return false;
+        }
+
+        return process.ExitCode == 0;
     }
 }

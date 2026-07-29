@@ -105,6 +105,16 @@ public sealed class FileSystemSourceProvider : ISourceProvider
     /// rooted second argument unchanged) or that walks up via <c>..</c> segments would otherwise
     /// read arbitrary files outside the project entirely, symlinks aside.
     /// </summary>
+    /// <remarks>
+    /// Also re-checks the reparse-point attribute <see cref="EnumerateIndexedFiles"/> already
+    /// enforces during the walk: <see cref="ReadTextAsync"/>/<see cref="ReadLinesAsync"/>/<see
+    /// cref="StatAsync"/> run in a later pass over already-enumerated paths (indexing hundreds of
+    /// files takes minutes, see the README), so a same-named entry replaced by a symlink between
+    /// the walk and the read would otherwise bypass the class-level "symlinks are never followed"
+    /// guarantee entirely for the read path. This closes the direct vector (the final path
+    /// component); a symlink on an intermediate ancestor directory is a separate, harder problem
+    /// this does not attempt to solve.
+    /// </remarks>
     private string Resolve(string relativePath)
     {
         string combined = Path.Combine(_root, relativePath.Replace('/', Path.DirectorySeparatorChar));
@@ -114,6 +124,13 @@ public sealed class FileSystemSourceProvider : ISourceProvider
         {
             throw new UnauthorizedAccessException(
                 $"'{relativePath}' resolves to '{fullPath}', which is outside the project root '{_root}'.");
+        }
+
+        FileAttributes? attributes = TryGetAttributes(fullPath);
+        if (attributes?.HasFlag(FileAttributes.ReparsePoint) == true)
+        {
+            throw new UnauthorizedAccessException(
+                $"'{relativePath}' resolves to a symlink/junction at '{fullPath}', which is never dereferenced.");
         }
 
         return fullPath;
