@@ -43,13 +43,25 @@ public sealed class ProgramStartupValidationTests
                 ["CODEINDEX_CodeIndex__Projects__1__Root"] = rootB,
             });
 
-            (string stderr, string _) = await ReadBothStreamsAsync(process, TestContext.Current.CancellationToken);
-            bool exited = process.WaitForExit(30_000);
+            try
+            {
+                (string stderr, string _) = await ReadBothStreamsAsync(process, TestContext.Current.CancellationToken);
+                bool exited = process.WaitForExit(30_000);
 
-            Assert.True(exited, "Server process should fail fast at startup, not hang waiting on stdio.");
-            Assert.NotEqual(0, process.ExitCode);
-            Assert.Contains("dup-startup-project", stderr, StringComparison.Ordinal);
-            Assert.Contains("must be unique", stderr, StringComparison.OrdinalIgnoreCase);
+                Assert.True(exited, "Server process should fail fast at startup, not hang waiting on stdio.");
+                Assert.NotEqual(0, process.ExitCode);
+                Assert.Contains("dup-startup-project", stderr, StringComparison.Ordinal);
+                Assert.Contains("must be unique", stderr, StringComparison.OrdinalIgnoreCase);
+            }
+            finally
+            {
+                // using Process only Dispose()s on scope exit, which does not kill a still-running
+                // process — if an assertion above throws (e.g. a startup-validation regression that
+                // makes the server hang instead of failing fast), the child would otherwise be
+                // orphaned and keep accumulating across CI re-runs.
+                if (!process.HasExited)
+                    process.Kill(entireProcessTree: true);
+            }
         }
         finally
         {
@@ -69,12 +81,20 @@ public sealed class ProgramStartupValidationTests
             ["CODEINDEX_CodeIndex__Projects__0__Root"] = "",
         });
 
-        (string stderr, string _) = await ReadBothStreamsAsync(process, TestContext.Current.CancellationToken);
-        bool exited = process.WaitForExit(30_000);
+        try
+        {
+            (string stderr, string _) = await ReadBothStreamsAsync(process, TestContext.Current.CancellationToken);
+            bool exited = process.WaitForExit(30_000);
 
-        Assert.True(exited, "Server process should fail fast at startup, not hang waiting on stdio.");
-        Assert.NotEqual(0, process.ExitCode);
-        Assert.False(string.IsNullOrWhiteSpace(stderr));
+            Assert.True(exited, "Server process should fail fast at startup, not hang waiting on stdio.");
+            Assert.NotEqual(0, process.ExitCode);
+            Assert.False(string.IsNullOrWhiteSpace(stderr));
+        }
+        finally
+        {
+            if (!process.HasExited)
+                process.Kill(entireProcessTree: true);
+        }
     }
 
     private static Process StartServer(Dictionary<string, string?> environmentOverrides)

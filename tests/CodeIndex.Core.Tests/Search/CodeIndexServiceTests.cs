@@ -718,26 +718,22 @@ public sealed class CodeIndexServiceTests : IDisposable
 
         public async Task<SourceFileStat> StatAsync(string relativePath, CancellationToken cancellationToken)
         {
-            bool useRacyStat;
+            SourceFileStat? racyStat = null;
             lock (_gate)
             {
                 if (_remainingNormalCalls.TryGetValue(relativePath, out int remaining) && remaining <= 0)
                 {
-                    useRacyStat = true;
+                    racyStat = _racyStats[relativePath];
                 }
-                else
+                else if (_remainingNormalCalls.ContainsKey(relativePath))
                 {
-                    useRacyStat = false;
-                    if (_remainingNormalCalls.ContainsKey(relativePath))
-                    {
-                        _remainingNormalCalls[relativePath] = remaining - 1;
-                    }
+                    _remainingNormalCalls[relativePath] = remaining - 1;
                 }
             }
 
-            if (useRacyStat)
+            if (racyStat is not null)
             {
-                return _racyStats[relativePath];
+                return racyStat.Value;
             }
 
             return await _inner.StatAsync(relativePath, cancellationToken).ConfigureAwait(false);
