@@ -9,8 +9,9 @@ namespace CodeIndex.Core.Chunking;
 /// <summary>
 /// Splits a C# file into one chunk per type declaration plus one chunk per indexable
 /// member (methods, constructors, properties, indexers, operators, conversion operators,
-/// event fields, delegates, and const/static-readonly fields). Syntax-only — no semantic
-/// model, no compilation — so this stays fast and needs no project references to run.
+/// event fields, events with explicit add/remove accessors, delegates, and const/static-readonly
+/// fields). Syntax-only — no semantic model, no compilation — so this stays fast and needs no
+/// project references to run.
 /// </summary>
 public sealed partial class RoslynChunker
 {
@@ -123,6 +124,12 @@ public sealed partial class RoslynChunker
                     yield return chunk;
                 }
 
+                break;
+
+            case EventDeclarationSyntax eventDeclaration:
+                yield return CreateSimpleMemberChunk(
+                    filePath, eventDeclaration, ChunkKind.Field, eventDeclaration.Identifier.Text,
+                    BuildEventSignature(eventDeclaration));
                 break;
 
             case FieldDeclarationSyntax field when IsIndexableField(field):
@@ -347,6 +354,12 @@ public sealed partial class RoslynChunker
         return $"{modifiers}{indexer.Type} this[{parameters}]";
     }
 
+    private static string BuildEventSignature(EventDeclarationSyntax eventDeclaration)
+    {
+        string modifiers = BuildModifierPrefix(eventDeclaration.Modifiers);
+        return $"{modifiers}event {eventDeclaration.Type} {eventDeclaration.Identifier.Text}";
+    }
+
     private static string BuildModifierPrefix(SyntaxTokenList modifiers)
     {
         string text = string.Join(" ", modifiers.Select(m => m.Text));
@@ -384,6 +397,7 @@ public sealed partial class RoslynChunker
         PropertyDeclarationSyntax property => [property.Identifier.Text],
         FieldDeclarationSyntax field => field.Declaration.Variables.Select(v => v.Identifier.Text),
         EventFieldDeclarationSyntax eventField => eventField.Declaration.Variables.Select(v => v.Identifier.Text),
+        EventDeclarationSyntax eventDeclaration => [eventDeclaration.Identifier.Text],
         IndexerDeclarationSyntax => ["this[]"],
         OperatorDeclarationSyntax op => [$"operator {op.OperatorToken.Text}"],
         ConversionOperatorDeclarationSyntax conv => [$"{conv.ImplicitOrExplicitKeyword.Text} operator {conv.Type}"],

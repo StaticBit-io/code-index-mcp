@@ -215,6 +215,31 @@ public sealed class RoslynChunkerCoverageTests
     }
 
     [Fact]
+    public void Chunk_IndexesEventWithExplicitAddRemoveAccessors()
+    {
+        // Distinct from Chunk_IndexesEventField above: this is EventDeclarationSyntax (an event
+        // with its own add/remove block), which Roslyn models separately from
+        // EventFieldDeclarationSyntax (a plain "event Handler Foo;").
+        const string source = """
+            namespace Acme;
+
+            public class Publisher
+            {
+                public event EventHandler? Updated
+                {
+                    add { }
+                    remove { }
+                }
+            }
+            """;
+
+        CodeChunk field = _chunker.Chunk("Publisher.cs", source).Single(c => c.Kind == ChunkKind.Field);
+
+        Assert.Equal("Acme.Publisher.Updated", field.Symbol);
+        Assert.Equal("public event EventHandler? Updated", field.Signature);
+    }
+
+    [Fact]
     public void Chunk_IndexesTopLevelDelegate()
     {
         const string source = """
@@ -261,6 +286,12 @@ public sealed class RoslynChunkerCoverageTests
                 public static implicit operator string(Amount value) => value.ToString();
                 public string this[string key] => key;
                 public delegate void Callback();
+
+                public event EventHandler? Changed
+                {
+                    add { }
+                    remove { }
+                }
             }
             """;
 
@@ -270,6 +301,7 @@ public sealed class RoslynChunkerCoverageTests
         Assert.Contains("implicit operator string", type.EmbedText, StringComparison.Ordinal);
         Assert.Contains("this[]", type.EmbedText, StringComparison.Ordinal);
         Assert.Contains("Callback", type.EmbedText, StringComparison.Ordinal);
+        Assert.Contains("Changed", type.EmbedText, StringComparison.Ordinal);
     }
 
     [Fact]
