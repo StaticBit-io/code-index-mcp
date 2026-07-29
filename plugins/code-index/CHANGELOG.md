@@ -2,6 +2,17 @@
 
 All notable changes to this plugin are listed here. Newest at the top.
 
+## v0.1.2 — 2026-07-29
+
+### Documentation
+- the `code-search` skill only covered usage, leaving an agent with no way to
+  recognize an unindexed project or offer to configure one. It now covers
+  reading `code_index_status` for that signal, when offering is (and isn't)
+  warranted given the ~0.6s/file indexing cost, how to add a project to
+  `~/.code-index-mcp/config.json` (including `Id`'s validation rules and why
+  environment variables can't register a project), and that the config file
+  is user settings — never edit it without showing the change first.
+
 ## v0.1.1 — 2026-07-29
 
 ### Fixes
