@@ -1,0 +1,21 @@
+{
+  "name": "code-index",
+  "description": "Local stdio MCP that gives Claude Code semantic search over C# codebases. Spawns CodeIndex.Server.dll under the user's .NET 10 runtime; embeddings are computed locally via Ollama (qwen3-embedding:4b). Four tools: code_search, code_get_chunk, code_index_status, code_reindex.",
+  "version": "0.1.0",
+  "author": {
+    "name": "StaticBit",
+    "url": "https://github.com/StaticBit-io"
+  },
+  "homepage": "https://github.com/StaticBit-io/code-index-mcp",
+  "license": "MIT",
+  "keywords": [
+    "csharp",
+    "semantic-search",
+    "code-search",
+    "ollama",
+    "embeddings",
+    "local",
+    "stdio",
+    "mcp"
+  ]
+}
