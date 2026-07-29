@@ -42,7 +42,7 @@ public sealed class OverlayIndexBuilderTests : IDisposable
         }
         """;
 
-    private (OverlayIndexBuilder Overlay, IndexBuilder Base, StubEmbeddingClient Embedder) CreateBuilder(
+    private (OverlayIndexBuilder Overlay, StubEmbeddingClient Embedder) CreateBuilder(
         InMemorySourceProvider source, int maxOverlays = 8, int activationThreshold = 10)
     {
         StubEmbeddingClient embedder = new();
@@ -50,7 +50,7 @@ public sealed class OverlayIndexBuilderTests : IDisposable
         ChunkerPipeline pipeline = new(new RoslynChunker(), new FallbackChunker());
         IndexBuilder baseBuilder = new(source, pipeline, embedder, store, Options.Create(new CodeIndexOptions()));
         OverlayIndexBuilder overlay = new(baseBuilder, source, _dir, maxOverlays, activationThreshold);
-        return (overlay, baseBuilder, embedder);
+        return (overlay, embedder);
     }
 
     private string OverlaysDirectory => Path.Combine(_dir, "overlays");
@@ -63,7 +63,7 @@ public sealed class OverlayIndexBuilderTests : IDisposable
             ["src/A.cs"] = MakeFile("Acme.A", "Widget", "DoA"),
             ["src/B.cs"] = MakeFile("Acme.B", "Gadget", "DoB"),
         });
-        (OverlayIndexBuilder overlay, _, _) = CreateBuilder(source, activationThreshold: 10);
+        (OverlayIndexBuilder overlay, _) = CreateBuilder(source, activationThreshold: 10);
 
         IndexSnapshot snapshot = await overlay.RefreshAsync(TestContext.Current.CancellationToken);
         Assert.False(Directory.Exists(OverlaysDirectory));
@@ -90,7 +90,7 @@ public sealed class OverlayIndexBuilderTests : IDisposable
             ["src/C.cs"] = MakeFile("Acme.C", "Thing", "DoC"),
             ["src/D.cs"] = MakeFile("Acme.D", "Other", "DoD"),
         });
-        (OverlayIndexBuilder overlay, _, StubEmbeddingClient embedder) = CreateBuilder(source, maxOverlays: 4, activationThreshold: 2);
+        (OverlayIndexBuilder overlay, StubEmbeddingClient embedder) = CreateBuilder(source, maxOverlays: 4, activationThreshold: 2);
 
         IndexSnapshot mainState = await overlay.RefreshAsync(TestContext.Current.CancellationToken);
         Assert.False(Directory.Exists(OverlaysDirectory));
@@ -142,7 +142,7 @@ public sealed class OverlayIndexBuilderTests : IDisposable
             ["src/B.cs"] = MakeFile("Acme.B", "Gadget", "DoB"),
             ["src/C.cs"] = MakeFile("Acme.C", "Thing", "DoC"),
         });
-        (OverlayIndexBuilder overlay, _, _) = CreateBuilder(source, activationThreshold: 2);
+        (OverlayIndexBuilder overlay, _) = CreateBuilder(source, activationThreshold: 2);
 
         IndexSnapshot mainState = await overlay.RefreshAsync(TestContext.Current.CancellationToken);
         byte[] baseManifestBefore = await File.ReadAllBytesAsync(Path.Combine(_dir, "manifest.json"), TestContext.Current.CancellationToken);
@@ -173,7 +173,7 @@ public sealed class OverlayIndexBuilderTests : IDisposable
             ["src/A.cs"] = MakeFile("Acme.A", "Widget", "DoA"),
             ["src/B.cs"] = MakeFile("Acme.B", "Gadget", "DoB"),
         });
-        (OverlayIndexBuilder overlay, _, _) = CreateBuilder(source, maxOverlays: 1, activationThreshold: 1);
+        (OverlayIndexBuilder overlay, _) = CreateBuilder(source, maxOverlays: 1, activationThreshold: 1);
 
         IndexSnapshot mainState = await overlay.RefreshAsync(TestContext.Current.CancellationToken);
 
@@ -196,6 +196,70 @@ public sealed class OverlayIndexBuilderTests : IDisposable
 
         string[] remainingSlots = Directory.GetDirectories(OverlaysDirectory);
         Assert.Single(remainingSlots);
+    }
+
+    [Fact]
+    public async Task ADivergingRefreshRecoversInsteadOfCrashingWhenActiveSlotIdIsMissingFromSlots()
+    {
+        InMemorySourceProvider source = new(new Dictionary<string, string>
+        {
+            ["src/A.cs"] = MakeFile("Acme.A", "Widget", "DoA"),
+            ["src/B.cs"] = MakeFile("Acme.B", "Gadget", "DoB"),
+        });
+        (OverlayIndexBuilder overlay, _) = CreateBuilder(source, maxOverlays: 4, activationThreshold: 1);
+
+        IndexSnapshot mainState = await overlay.RefreshAsync(TestContext.Current.CancellationToken);
+
+        // Diverge once to create an overlay and activate its slot.
+        source.Set("src/A.cs", MakeFile("Acme.A", "Widget", "DoAOne"));
+        IndexSnapshot state1 = await overlay.RefreshAsync(TestContext.Current.CancellationToken, mainState);
+        Assert.True(Directory.Exists(OverlaysDirectory));
+
+        // Corrupt the registry: keep ActiveSlotId pointing at a slot that no longer appears in
+        // Slots, simulating a hand-edited or partially-written registry.json -- the only way this
+        // state can arise in practice, since this class only ever sets ActiveSlotId to a slot id
+        // it just added to Slots in the same write. Before the fix, the next genuine divergence
+        // crashed with ArgumentOutOfRangeException on slots[activeIndex] in ApplyDivergenceAsync.
+        OverlayRegistryStore registryStore = new(_dir);
+        OverlayRegistryDocument registry = await registryStore.LoadAsync(state1.Header.Generation, TestContext.Current.CancellationToken);
+        Assert.NotNull(registry.ActiveSlotId);
+        await registryStore.SaveAsync(registry with { Slots = [] }, TestContext.Current.CancellationToken);
+
+        // A further genuine divergence must recover (mint a fresh slot) instead of crashing.
+        source.Set("src/B.cs", MakeFile("Acme.B", "Gadget", "DoBTwo"));
+        IndexSnapshot state2 = await overlay.RefreshAsync(TestContext.Current.CancellationToken, state1);
+
+        Assert.Contains(state2.Chunks, c => c.Symbol == "Acme.B.Gadget.DoBTwo");
+        Assert.Contains(state2.Chunks, c => c.Symbol == "Acme.A.Widget.DoAOne"); // still carried from the earlier overlay diff
+    }
+
+    [Fact]
+    public async Task ASmallChangeFoldsIntoBaseInsteadOfWritingAnOrphanSlotWhenActiveSlotIdIsMissingFromSlots()
+    {
+        InMemorySourceProvider source = new(new Dictionary<string, string>
+        {
+            ["src/A.cs"] = MakeFile("Acme.A", "Widget", "DoA"),
+            ["src/B.cs"] = MakeFile("Acme.B", "Gadget", "DoB"),
+        });
+        (OverlayIndexBuilder overlay, _) = CreateBuilder(source, maxOverlays: 4, activationThreshold: 5);
+
+        IndexSnapshot mainState = await overlay.RefreshAsync(TestContext.Current.CancellationToken);
+
+        // Same corruption as above, reached through ApplySmallChangeAsync instead: an ActiveSlotId
+        // absent from Slots. This path never crashed (it matches by SlotId via Select, not by
+        // index), but it silently wrote into "overlays/ghost-slot/" -- a directory the registry
+        // does not track and nothing would ever load back -- instead of folding the change into
+        // base like it would with no active overlay at all.
+        OverlayRegistryStore registryStore = new(_dir);
+        await registryStore.SaveAsync(
+            OverlayRegistryDocument.Empty(mainState.Header.Generation) with { ActiveSlotId = "ghost-slot" },
+            TestContext.Current.CancellationToken);
+
+        source.Set("src/A.cs", MakeFile("Acme.A", "Widget", "DoARenamed"));
+        IndexSnapshot afterSmallEdit = await overlay.RefreshAsync(TestContext.Current.CancellationToken, mainState);
+
+        Assert.Contains(afterSmallEdit.Chunks, c => c.Symbol == "Acme.A.Widget.DoARenamed");
+        Assert.False(Directory.Exists(Path.Combine(OverlaysDirectory, "ghost-slot")));
     }
 
     [Fact]
@@ -280,5 +344,60 @@ public sealed class OverlayIndexBuilderTests : IDisposable
         Assert.DoesNotContain(composed.Chunks, c => c.Symbol == "B.Old"); // masked by the overlay
         Assert.DoesNotContain(composed.Chunks, c => c.Symbol == "C.M");   // hidden: deleted in the overlay
         Assert.Equal(2, composed.Fingerprints.Count);
+    }
+
+    [Fact]
+    public void ExtractDiffTracksAChangedZeroChunkFileAndNeverTreatsAnUnchangedOneAsDeleted()
+    {
+        // "src/Empty.cs" contributes zero chunks in every snapshot below (e.g. an empty file, or
+        // one containing only comments) -- it still gets a fingerprint from IndexBuilder.BuildAsync
+        // (see IndexBuilder.BuildAsync, which fingerprints every enumerated path unconditionally),
+        // so ExtractDiff must track it by fingerprint even though BuildFileIndex(chunks) never sees it.
+        CodeChunk baseChunkA = new()
+        {
+            FilePath = "src/A.cs", StartLine = 1, EndLine = 1, Kind = ChunkKind.Method,
+            Symbol = "A.M", Signature = "void M()",
+        };
+
+        IndexSnapshot @base = new()
+        {
+            Header = new IndexHeader
+            {
+                SchemaVersion = IndexHeader.CurrentSchemaVersion, Model = "stub", Dimensions = 1, ChunkCount = 1, BuiltAtUtc = DateTime.UnixEpoch,
+            },
+            Chunks = [baseChunkA],
+            Fingerprints =
+            [
+                new FileFingerprint("src/A.cs", 1, DateTime.UnixEpoch, "hashA"),
+                new FileFingerprint("src/Empty.cs", 0, DateTime.UnixEpoch, "hashEmpty"),
+            ],
+            Vectors = [1f],
+        };
+
+        // A.cs is unchanged; Empty.cs's content actually changed (new hash) but still yields zero
+        // chunks -- it must show up as overridden (by fingerprint), not silently dropped.
+        IndexSnapshot updatedWithChangedEmptyFile = @base with
+        {
+            Fingerprints =
+            [
+                new FileFingerprint("src/A.cs", 1, DateTime.UnixEpoch, "hashA"),
+                new FileFingerprint("src/Empty.cs", 2, DateTime.UnixEpoch, "hashEmptyChanged"),
+            ],
+        };
+
+        (IndexSnapshot overlayData, IReadOnlyList<string> deletedPaths) =
+            OverlayComposer.ExtractDiff(@base, updatedWithChangedEmptyFile);
+
+        Assert.Empty(deletedPaths);
+        Assert.Contains(overlayData.Fingerprints, f => f.RelativePath == "src/Empty.cs" && f.ContentHash == "hashEmptyChanged");
+        Assert.DoesNotContain(overlayData.Fingerprints, f => f.RelativePath == "src/A.cs");
+        Assert.Empty(overlayData.Chunks); // still zero chunks -- no chunk to carry, only the fingerprint
+
+        // Nothing changed at all this time (same base, same "updated") -- Empty.cs must not be
+        // reported as deleted merely because it never appears in BuildFileIndex(chunks).
+        (IndexSnapshot noOpOverlayData, IReadOnlyList<string> noOpDeletedPaths) = OverlayComposer.ExtractDiff(@base, @base);
+
+        Assert.Empty(noOpDeletedPaths);
+        Assert.Empty(noOpOverlayData.Fingerprints);
     }
 }

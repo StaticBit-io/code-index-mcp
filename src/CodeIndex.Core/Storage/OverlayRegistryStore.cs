@@ -52,11 +52,22 @@ public sealed class OverlayRegistryStore
         FileStream stream = new(path, FileMode.Open, FileAccess.Read, FileShare.Read);
         await using (stream.ConfigureAwait(false))
         {
-            OverlayRegistryDocument? document = await JsonSerializer
-                .DeserializeAsync<OverlayRegistryDocument>(stream, SerializerOptions, cancellationToken)
-                .ConfigureAwait(false);
+            try
+            {
+                OverlayRegistryDocument? document = await JsonSerializer
+                    .DeserializeAsync<OverlayRegistryDocument>(stream, SerializerOptions, cancellationToken)
+                    .ConfigureAwait(false);
 
-            return document ?? OverlayRegistryDocument.Empty(compositionGenerationIfMissing);
+                return document ?? OverlayRegistryDocument.Empty(compositionGenerationIfMissing);
+            }
+            catch (JsonException)
+            {
+                // The overlay pool is purely an optimisation over the base index (see the class
+                // remarks): a truncated or schema-incompatible registry.json must degrade to "no
+                // overlays cached" rather than take the whole project's search down with it, the
+                // same way IndexStore.LoadAsync degrades a corrupted base index.
+                return OverlayRegistryDocument.Empty(compositionGenerationIfMissing);
+            }
         }
     }
 

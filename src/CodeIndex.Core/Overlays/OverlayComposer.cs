@@ -126,10 +126,14 @@ public static class OverlayComposer
         List<FileFingerprint> overriddenFingerprints = new();
         List<(int Offset, int Count)> overriddenRuns = new();
 
-        foreach ((string path, (int offset, int count)) in updatedIndex.OrderBy(kv => kv.Key, StringComparer.Ordinal))
+        // Iterates every fingerprint, not just paths with at least one chunk: a file that
+        // legitimately produces zero chunks (e.g. empty, or a comment-only source file) still
+        // gets a fingerprint from IndexBuilder.BuildAsync, so driving this loop off updatedIndex
+        // alone would silently drop such a file from overriddenFingerprints when it changes, and
+        // mark it "deleted" below (it is absent from updatedIndex) even when it is merely
+        // unchanged and chunk-less in both base and updated.
+        foreach ((string path, FileFingerprint updatedFingerprint) in updatedFingerprints.OrderBy(kv => kv.Key, StringComparer.Ordinal))
         {
-            FileFingerprint updatedFingerprint = updatedFingerprints[path];
-
             bool matchesBase = baseFingerprints.TryGetValue(path, out FileFingerprint? baseFingerprint) &&
                 string.Equals(baseFingerprint.ContentHash, updatedFingerprint.ContentHash, StringComparison.Ordinal);
 
@@ -138,13 +142,17 @@ public static class OverlayComposer
                 continue;
             }
 
-            for (int i = 0; i < count; i++)
+            if (updatedIndex.TryGetValue(path, out (int Offset, int Count) run))
             {
-                overriddenChunks.Add(updated.Chunks[offset + i]);
+                for (int i = 0; i < run.Count; i++)
+                {
+                    overriddenChunks.Add(updated.Chunks[run.Offset + i]);
+                }
+
+                overriddenRuns.Add(run);
             }
 
             overriddenFingerprints.Add(updatedFingerprint);
-            overriddenRuns.Add((offset, count));
         }
 
         float[] overriddenVectors = new float[overriddenChunks.Count * dimensions];
@@ -157,7 +165,7 @@ public static class OverlayComposer
         }
 
         List<string> deletedPaths = baseFingerprints.Keys
-            .Where(path => !updatedIndex.ContainsKey(path))
+            .Where(path => !updatedFingerprints.ContainsKey(path))
             .OrderBy(path => path, StringComparer.Ordinal)
             .ToList();
 

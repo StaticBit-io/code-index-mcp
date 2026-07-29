@@ -156,7 +156,13 @@ public sealed class OverlayIndexBuilder : IIndexBuilder
             ? updated
             : updated with { Header = updated.Header with { Generation = generation } };
 
-        if (registry.ActiveSlotId is null)
+        // Same defensive guard as ApplyDivergenceAsync's activeIndex check: an ActiveSlotId absent
+        // from Slots (a corrupted or hand-edited registry.json) must be treated as "no active
+        // slot" rather than saved into a slot directory the registry itself does not track.
+        bool activeSlotExists = registry.ActiveSlotId is not null &&
+            registry.Slots.Any(s => string.Equals(s.SlotId, registry.ActiveSlotId, StringComparison.Ordinal));
+
+        if (!activeSlotExists)
         {
             await _baseBuilder.PersistAsync(result, cancellationToken).ConfigureAwait(false);
             _baseSnapshot = result;
@@ -169,10 +175,11 @@ public sealed class OverlayIndexBuilder : IIndexBuilder
             return result;
         }
 
+        string activeSlotId = registry.ActiveSlotId!;
         (IndexSnapshot OverlayData, IReadOnlyList<string> DeletedPaths) diff = OverlayComposer.ExtractDiff(_baseSnapshot!, result);
         string contentKey = OverlayComposer.ComputeContentKey(diff.OverlayData.Fingerprints, diff.DeletedPaths);
 
-        IndexStore slotStore = new(_registryStore.SlotDirectory(registry.ActiveSlotId));
+        IndexStore slotStore = new(_registryStore.SlotDirectory(activeSlotId));
         await slotStore.SaveAsync(diff.OverlayData, cancellationToken).ConfigureAwait(false);
 
         DateTime now = DateTime.UtcNow;
@@ -180,7 +187,7 @@ public sealed class OverlayIndexBuilder : IIndexBuilder
         {
             CompositionGeneration = generation,
             Slots = registry.Slots
-                .Select(slot => string.Equals(slot.SlotId, registry.ActiveSlotId, StringComparison.Ordinal)
+                .Select(slot => string.Equals(slot.SlotId, activeSlotId, StringComparison.Ordinal)
                     ? slot with { ContentKey = contentKey, DeletedPaths = diff.DeletedPaths, LastUsedUtc = now }
                     : slot)
                 .ToList(),
@@ -270,18 +277,30 @@ public sealed class OverlayIndexBuilder : IIndexBuilder
         string slotId;
         int nextSequence = registry.NextSlotSequence;
 
-        if (registry.ActiveSlotId is not null)
+        // ActiveSlotId is only ever set by this class to a slot id it just wrote into Slots (see
+        // below and ApplySmallChangeAsync), but the registry is loaded straight off disk — a
+        // hand-edited or otherwise corrupted registry.json could carry an ActiveSlotId absent from
+        // Slots, which FindIndex reports as -1. Treated as "no active slot" (falls through to the
+        // new-slot branch below) rather than indexing with -1 and crashing.
+        int activeIndex = registry.ActiveSlotId is null
+            ? -1
+            : slots.FindIndex(s => string.Equals(s.SlotId, registry.ActiveSlotId, StringComparison.Ordinal));
+
+        if (activeIndex >= 0)
         {
             // Still the same working branch, evolved further since it was last cached: update its
             // own slot rather than minting a new one, so continued development on a divergent
             // branch never consumes the overlay pool.
-            slotId = registry.ActiveSlotId;
-            int index = slots.FindIndex(s => string.Equals(s.SlotId, slotId, StringComparison.Ordinal));
-            slots[index] = slots[index] with { ContentKey = contentKey, DeletedPaths = diff.DeletedPaths, LastUsedUtc = now };
+            slotId = slots[activeIndex].SlotId;
+            slots[activeIndex] = slots[activeIndex] with { ContentKey = contentKey, DeletedPaths = diff.DeletedPaths, LastUsedUtc = now };
         }
         else
         {
-            if (slots.Count >= _maxOverlays)
+            // A while, not an if: if _maxOverlays was lowered in configuration after the pool
+            // already grew past the new limit, a single eviction would leave it permanently over
+            // budget. Looping keeps "no more than _maxOverlays slots" true regardless of how the
+            // pool got here.
+            while (slots.Count >= _maxOverlays && slots.Count > 0)
             {
                 OverlaySlotInfo leastRecentlyUsed = slots.OrderBy(s => s.LastUsedUtc).First();
                 slots.Remove(leastRecentlyUsed);
