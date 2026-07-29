@@ -32,18 +32,48 @@ public sealed class EmbeddingOptions
     public string KeepAlive { get; set; } = "30m";
 
     /// <summary>
-    /// Task-instruction prefix applied only to the query side of a search — never to chunk/passage
-    /// text — formatted as <c>"Instruct: {QueryInstruction}\nQuery: {query}"</c> before being sent
-    /// to the embedding backend. Qwen3-Embedding (and other E5/GTE-family models) are trained
-    /// asymmetrically: passages are encoded plain, but the model expects a query to carry an
-    /// instruction naming the retrieval task, and omitting it measurably hurts ranking quality
+    /// Raw prefix prepended verbatim to the query side of a search — never to chunk/passage
+    /// text — before being sent to the embedding backend: the request text is simply
+    /// <c>$"{QueryInstruction}{query}"</c>. Many embedding models are trained asymmetrically:
+    /// passages are encoded plain, but the model expects a query to carry a short prefix naming
+    /// (or at least marking) the retrieval task, and omitting it measurably hurts ranking quality
     /// for exactly the kind of natural-language "how/where does X happen" query this tool exists
     /// to answer. See <see cref="Embedding.IEmbeddingClient.EmbedQueryAsync"/> for why this cannot
     /// be applied via the same code path as passage embedding. Set to <c>null</c> or empty to send
     /// the bare query with no prefix (e.g. when pointed at a model with no such training).
     /// </summary>
+    /// <remarks>
+    /// This is a raw prefix, not a template — the caller supplies the complete string, including
+    /// any trailing separator/whitespace the target model expects. Different model families use
+    /// different conventions, so this must be re-derived per model rather than assumed:
+    /// <list type="bullet">
+    /// <item><description>
+    /// <b>Qwen3-Embedding</b> (0.6b/4b/8b — E5/GTE-style instruction format): <c>"Instruct: Given a
+    /// developer's question about a codebase, retrieve the C# code that implements it.\nQuery: "</c>
+    /// (the default here) — note the trailing <c>"\nQuery: "</c> is part of the prefix itself, not
+    /// added by code.
+    /// </description></item>
+    /// <item><description>
+    /// <b>nomic-embed-text</b>: <c>"search_query: "</c> on the query side, and — a limitation of
+    /// this project's current architecture, not of the model — no equivalent
+    /// <c>"search_document: "</c> prefix is ever applied to indexed passage/chunk text, since
+    /// <see cref="Embedding.IEmbeddingClient.EmbedAsync"/> has no such hook. Measure accordingly:
+    /// numbers for this model reflect a query-side-only approximation of its intended asymmetric
+    /// usage.
+    /// </description></item>
+    /// <item><description>
+    /// <b>mxbai-embed-large</b>: <c>"Represent this sentence for searching relevant passages: "</c>.
+    /// </description></item>
+    /// <item><description>
+    /// <b>all-minilm</b> (and other models with no asymmetric training): <c>null</c> or empty —
+    /// there is no prefix to add.
+    /// </description></item>
+    /// </list>
+    /// See the README's model-comparison table for the measured effect of getting this right vs.
+    /// wrong per model.
+    /// </remarks>
     public string? QueryInstruction { get; set; } =
-        "Given a developer's question about a codebase, retrieve the C# code that implements it.";
+        "Instruct: Given a developer's question about a codebase, retrieve the C# code that implements it.\nQuery: ";
 
     /// <summary>
     /// Relevance floor for the vector branch of a search: a chunk whose cosine similarity to the
