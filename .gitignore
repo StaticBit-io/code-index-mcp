@@ -31,7 +31,13 @@ appsettings.Local.json
 Thumbs.db
 .DS_Store
 
-## The plugin's bin/ is a committed deliverable (published server + launcher),
-## not a build output directory — un-ignore it despite the blanket "bin/" rule above.
+## The plugin's bin/ ships the launcher script and its release checksum —
+## source, not build output — so un-ignore those specific files despite the
+## blanket "bin/" rule above. The published server build itself is fetched
+## from a GitHub Release at runtime (see bin/server.js) and must stay
+## ignored: a local `dotnet publish -o .../bin/server` for testing should
+## never be committed again.
 !/plugins/**/bin/
-!/plugins/**/bin/**
+!/plugins/**/bin/server.js
+!/plugins/**/bin/*.sha256
+/plugins/**/bin/server/

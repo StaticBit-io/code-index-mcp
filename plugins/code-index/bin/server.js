@@ -11,9 +11,17 @@
 // spawned, and prints to stderr — stdout is reserved for the MCP protocol
 // stream once the child process starts.
 //
+// The published server build is NOT committed to this repository — it is
+// fetched on demand from a GitHub Release, cached under
+// ~/.code-index-mcp/server/<version>/, and verified against a checksum that
+// ships inside the plugin package itself (bin/server.sha256). See
+// ensureServerInstalled() below for the full flow and README.md's
+// "Troubleshooting" section for the exact messages each failure path prints.
+//
 // Layout:
 //   bin/server.js          <- this file
-//   bin/server/CodeIndex.Server.dll (+ deps, appsettings.json)
+//   bin/server.sha256      <- expected sha256 of this version's release asset
+//   ~/.code-index-mcp/server/<version>/CodeIndex.Server.dll (+ deps, appsettings.json)
 //
 // The server is a portable, framework-dependent build (no native/AOT
 // dependencies anywhere in the dependency graph — see CodeIndex.Core.csproj),
@@ -26,11 +34,15 @@
 const path = require('node:path');
 const os = require('node:os');
 const fs = require('node:fs');
+const zlib = require('node:zlib');
+const crypto = require('node:crypto');
 const { spawnSync, spawn } = require('node:child_process');
 
-const SERVER_DLL = path.join(__dirname, 'server', 'CodeIndex.Server.dll');
-const DEFAULT_APPSETTINGS = path.join(__dirname, 'server', 'appsettings.json');
 const REQUIRED_NET_MAJOR = 10;
+
+const PLUGIN_ROOT = path.join(__dirname, '..');
+const PLUGIN_MANIFEST_PATH = path.join(PLUGIN_ROOT, '.claude-plugin', 'plugin.json');
+const CHECKSUM_FILE_PATH = path.join(__dirname, 'server.sha256');
 
 // Where the plugin looks for the user's project list. A JSON file is the
 // natural shape for "a handful of {Id, Root} pairs" — expressing several
@@ -162,11 +174,15 @@ function hasAnyProjectConfigured(env) {
   return Object.keys(env).some((key) => pattern.test(key) && env[key] && env[key].trim() !== '');
 }
 
-function resolveEmbeddingSetting(env, key, fallback) {
+/** `serverDir` is where this version's appsettings.json lives once installed
+ * (see ensureServerInstalled). Before that directory exists there is nothing
+ * to read here — callers only need this after the server is in place, since
+ * it's only used for the Ollama preflight, which runs after installation. */
+function resolveEmbeddingSetting(env, key, fallback, serverDir) {
   const envKey = `CODEINDEX_Embedding__${key}`;
   if (env[envKey]) return env[envKey];
 
-  const defaults = readJsonSafe(DEFAULT_APPSETTINGS);
+  const defaults = readJsonSafe(path.join(serverDir, 'appsettings.json'));
   const fromDefaults = defaults && defaults.Embedding && defaults.Embedding[key];
   return fromDefaults !== undefined ? fromDefaults : fallback;
 }
@@ -204,9 +220,9 @@ async function fetchWithTimeout(url, timeoutMs) {
   }
 }
 
-async function checkOllama(env) {
-  const endpoint = resolveEmbeddingSetting(env, 'Endpoint', 'http://localhost:11434');
-  const model = resolveEmbeddingSetting(env, 'Model', 'qwen3-embedding:4b');
+async function checkOllama(env, serverDir) {
+  const endpoint = resolveEmbeddingSetting(env, 'Endpoint', 'http://localhost:11434', serverDir);
+  const model = resolveEmbeddingSetting(env, 'Model', 'qwen3-embedding:4b', serverDir);
   const tagsUrl = new URL('/api/tags', endpoint).toString();
 
   let response;
@@ -261,18 +277,572 @@ async function checkOllama(env) {
   return true;
 }
 
+// ── Server binary: fetch from a GitHub Release, cache, verify ───────────────
+//
+// Design notes (see also README.md → "How the server binary is fetched"):
+//
+// - Version source: plugins/code-index/.claude-plugin/plugin.json carries a
+//   dedicated `serverVersion` field, deliberately separate from the plugin's
+//   own `version`. The plugin version covers the whole package (skills,
+//   docs, this launcher script); the server version identifies exactly which
+//   published server release asset to run. They move together today but
+//   don't have to — a docs/skill-only plugin bump shouldn't force a redundant
+//   14 MB re-download, and a server-only rebuild shouldn't force a marketplace
+//   version bump just to get users to pick it up.
+// - Cache location: ~/.code-index-mcp/server/<version>/, sibling to the
+//   existing ~/.code-index-mcp/config.json — same trust/home directory the
+//   rest of the plugin already uses.
+// - Checksum location: bin/server.sha256, committed in this repository and
+//   shipped as part of the plugin package itself. The repository is the
+//   trust anchor: the same commit that bumps serverVersion carries the
+//   checksum of the release it points to, so verification never depends on
+//   anything fetched over the network.
+// - Concurrency: install into a uniquely-named temp directory under the same
+//   cache root (so the final `fs.renameSync` is same-filesystem and atomic),
+//   write a `.verified-sha256` marker as the last file before renaming, then
+//   rename the temp directory onto the final path. A reader only ever
+//   observes the final path as either "absent" or "one complete, verified
+//   install" — a process killed mid-download or mid-extract only ever leaves
+//   debris in its own temp directory, never at the path other launchers
+//   check. If our rename loses a race to a concurrent install of the same
+//   version, we detect the already-valid target and just use it.
+// - Private-repo auth: every GitHub API call optionally carries a bearer
+//   token (CODEINDEX_GITHUB_TOKEN, then GH_TOKEN/GITHUB_TOKEN, then
+//   `gh auth token` if the GitHub CLI is installed and logged in). This
+//   works unchanged the day the repository goes public — no token resolves,
+//   none is sent, and anonymous access (subject to GitHub's normal
+//   unauthenticated rate limit) just works.
+
+const RELEASE_OWNER = 'StaticBit-io';
+const RELEASE_REPO = 'code-index-mcp';
+const GITHUB_API_BASE = 'https://api.github.com';
+const GITHUB_ISSUES_URL = `https://github.com/${RELEASE_OWNER}/${RELEASE_REPO}/issues`;
+
+const API_TIMEOUT_MS = 15000;
+const DOWNLOAD_TIMEOUT_MS = 300000; // 5 min — generous for ~14 MB on a slow link
+const STALE_TEMP_MAX_AGE_MS = 60 * 60 * 1000; // 1 hour
+
+const SERVER_CACHE_ROOT = path.join(os.homedir(), '.code-index-mcp', 'server');
+const VERIFIED_MARKER_NAME = '.verified-sha256';
+
+class NetworkError extends Error {}
+
+class HttpStatusError extends Error {
+  constructor(status, body) {
+    super(`HTTP ${status}`);
+    this.status = status;
+    this.body = body;
+  }
+}
+
+class ChecksumMismatchError extends Error {
+  constructor(expected, actual) {
+    super(`checksum mismatch (expected ${expected}, got ${actual})`);
+    this.expected = expected;
+    this.actual = actual;
+  }
+}
+
+function releaseTag(version) {
+  return `server-v${version}`;
+}
+
+function assetFileName(version) {
+  return `code-index-server-${version}.tar.gz`;
+}
+
+function releasePageUrl(version) {
+  return `https://github.com/${RELEASE_OWNER}/${RELEASE_REPO}/releases/tag/${releaseTag(version)}`;
+}
+
+function assetDownloadUrl(version) {
+  return `https://github.com/${RELEASE_OWNER}/${RELEASE_REPO}/releases/download/${releaseTag(version)}/${assetFileName(version)}`;
+}
+
+function cacheDirFor(version) {
+  return path.join(SERVER_CACHE_ROOT, version);
+}
+
+function readExpectedChecksum(version) {
+  let raw;
+  try {
+    raw = fs.readFileSync(CHECKSUM_FILE_PATH, 'utf8');
+  } catch (err) {
+    throw new Error(
+      `This plugin build is missing its server checksum file (${CHECKSUM_FILE_PATH}) — cannot safely ` +
+        'verify a downloaded server binary. Reinstall the plugin from the marketplace; if this persists, ' +
+        `please report it at ${GITHUB_ISSUES_URL}.`,
+    );
+  }
+
+  const match = raw.trim().match(/^([0-9a-fA-F]{64})\s+(\S+)$/);
+  if (!match) {
+    throw new Error(`${CHECKSUM_FILE_PATH} is not in the expected "<sha256>  <filename>" format.`);
+  }
+
+  const [, hex, fileName] = match;
+  const expectedFileName = assetFileName(version);
+  if (fileName !== expectedFileName) {
+    throw new Error(
+      `${CHECKSUM_FILE_PATH} names "${fileName}" but the plugin manifest expects server v${version} ` +
+        `(${expectedFileName}) — this plugin package looks inconsistent. Reinstall it from the marketplace.`,
+    );
+  }
+
+  return { hex: hex.toLowerCase(), fileName };
+}
+
+function isCacheReady(cacheDir, expectedHex) {
+  try {
+    const dll = path.join(cacheDir, 'CodeIndex.Server.dll');
+    if (!fs.existsSync(dll)) return false;
+    const marker = fs.readFileSync(path.join(cacheDir, VERIFIED_MARKER_NAME), 'utf8').trim().toLowerCase();
+    return marker === expectedHex.toLowerCase();
+  } catch {
+    return false;
+  }
+}
+
+function removeDirBestEffort(dir) {
+  try {
+    fs.rmSync(dir, { recursive: true, force: true });
+  } catch {
+    // best-effort cleanup only
+  }
+}
+
+function sweepStaleTempDirs() {
+  try {
+    for (const name of fs.readdirSync(SERVER_CACHE_ROOT)) {
+      if (!name.startsWith('.tmp-install-')) continue;
+      const full = path.join(SERVER_CACHE_ROOT, name);
+      let stat;
+      try {
+        stat = fs.statSync(full);
+      } catch {
+        continue;
+      }
+      if (Date.now() - stat.mtimeMs > STALE_TEMP_MAX_AGE_MS) removeDirBestEffort(full);
+    }
+  } catch {
+    // best-effort cleanup only — a missing/unreadable cache root is fine here
+  }
+}
+
+function resolveGitHubToken() {
+  const fromEnv = process.env.CODEINDEX_GITHUB_TOKEN || process.env.GH_TOKEN || process.env.GITHUB_TOKEN;
+  if (fromEnv && fromEnv.trim()) return fromEnv.trim();
+
+  try {
+    const result = spawnSync('gh', ['auth', 'token'], { encoding: 'utf8', timeout: 3000 });
+    if (result.status === 0 && result.stdout && result.stdout.trim()) return result.stdout.trim();
+  } catch {
+    // `gh` not installed, not on PATH, or not logged in — proceed without a token.
+  }
+  return undefined;
+}
+
+function buildGithubHeaders(token, accept) {
+  const headers = {
+    'User-Agent': 'code-index-mcp-launcher',
+    Accept: accept,
+    'X-GitHub-Api-Version': '2022-11-28',
+  };
+  if (token) headers.Authorization = `Bearer ${token}`;
+  return headers;
+}
+
+async function fetchWithAbort(url, options, timeoutMs) {
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), timeoutMs);
+  try {
+    return await fetch(url, { ...options, signal: controller.signal });
+  } catch (err) {
+    throw new NetworkError(err.message);
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+async function githubJson(url, token) {
+  const response = await fetchWithAbort(
+    url,
+    { headers: buildGithubHeaders(token, 'application/vnd.github+json') },
+    API_TIMEOUT_MS,
+  );
+  if (!response.ok) {
+    let body = '';
+    try {
+      body = await response.text();
+    } catch {
+      // ignore — status code alone is enough to report
+    }
+    throw new HttpStatusError(response.status, body);
+  }
+  return response.json();
+}
+
+async function resolveReleaseAsset(version, token) {
+  const tag = releaseTag(version);
+  const url = `${GITHUB_API_BASE}/repos/${RELEASE_OWNER}/${RELEASE_REPO}/releases/tags/${tag}`;
+  const release = await githubJson(url, token);
+
+  const fileName = assetFileName(version);
+  const asset = (release.assets || []).find((a) => a.name === fileName);
+  if (!asset) {
+    const err = new Error(`Release ${tag} exists but has no asset named ${fileName}.`);
+    err.code = 'ASSET_NOT_IN_RELEASE';
+    err.tag = tag;
+    throw err;
+  }
+  return asset;
+}
+
+function logDownloadProgress(received, total) {
+  const mb = (n) => (n / (1024 * 1024)).toFixed(1);
+  if (total > 0) {
+    const pct = Math.min(100, Math.round((received / total) * 100));
+    process.stderr.write(`\r[code-index] Downloaded ${mb(received)} MB / ${mb(total)} MB (${pct}%)`);
+  } else {
+    process.stderr.write(`\r[code-index] Downloaded ${mb(received)} MB`);
+  }
+}
+
+/** Downloads a release asset by its GitHub API asset id. Fetches the asset
+ * endpoint with `redirect: 'manual'` and, if GitHub answers with a redirect
+ * to a pre-signed storage URL (the common case for anything but tiny
+ * assets), follows it in a *separate* unauthenticated request. Blob storage
+ * behind a pre-signed URL commonly rejects a request that carries both a
+ * signature in the query string and an Authorization header — sending our
+ * GitHub token along on the redirect would break exactly the private-repo
+ * case it's meant to support. */
+async function downloadAssetBuffer(assetId, token, expectedSize) {
+  const assetUrl = `${GITHUB_API_BASE}/repos/${RELEASE_OWNER}/${RELEASE_REPO}/releases/assets/${assetId}`;
+
+  let response = await fetchWithAbort(
+    assetUrl,
+    { redirect: 'manual', headers: buildGithubHeaders(token, 'application/octet-stream') },
+    DOWNLOAD_TIMEOUT_MS,
+  );
+
+  if (response.status >= 300 && response.status < 400) {
+    const location = response.headers.get('location');
+    if (!location) throw new HttpStatusError(response.status, 'redirect response with no Location header');
+    response = await fetchWithAbort(location, { redirect: 'follow' }, DOWNLOAD_TIMEOUT_MS);
+  }
+
+  if (!response.ok) {
+    let body = '';
+    try {
+      body = await response.text();
+    } catch {
+      // ignore
+    }
+    throw new HttpStatusError(response.status, body);
+  }
+
+  const total = Number(response.headers.get('content-length')) || expectedSize || 0;
+  const chunks = [];
+  let received = 0;
+  let lastLog = 0;
+
+  try {
+    const reader = response.body.getReader();
+    for (;;) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      chunks.push(value);
+      received += value.length;
+      const now = Date.now();
+      if (now - lastLog > 500) {
+        lastLog = now;
+        logDownloadProgress(received, total);
+      }
+    }
+  } catch (err) {
+    throw new NetworkError(err.message);
+  }
+
+  logDownloadProgress(received, total);
+  process.stderr.write('\n');
+  return Buffer.concat(chunks);
+}
+
+function readCString(buf, start, len) {
+  const slice = buf.subarray(start, start + len);
+  const nul = slice.indexOf(0);
+  return (nul === -1 ? slice : slice.subarray(0, nul)).toString('utf8');
+}
+
+/** Minimal reader for the tar entries CI produces (`tar czf archive.tar.gz *`
+ * from the publish output directory): a flat list of regular files, short
+ * (ustar-header-sized) names, no long-name/pax extensions. Deliberately not
+ * a general-purpose tar implementation — just enough to unpack our own
+ * release asset without adding a dependency. The whole-archive sha256 is
+ * already verified before this ever runs; the per-header checksum check
+ * below is extra insurance against a bug in the offset arithmetic here, not
+ * a security boundary. */
+function parseTarBuffer(buf) {
+  const entries = [];
+  let offset = 0;
+
+  while (offset + 512 <= buf.length) {
+    const header = buf.subarray(offset, offset + 512);
+    if (header.every((b) => b === 0)) break; // end-of-archive marker
+
+    const name = readCString(header, 0, 100);
+    const sizeField = readCString(header, 124, 12).trim();
+    const typeFlag = String.fromCharCode(header[156]);
+    const prefix = readCString(header, 345, 155);
+    const checksumField = readCString(header, 148, 8).trim();
+
+    const size = sizeField === '' ? 0 : parseInt(sizeField, 8);
+
+    const expectedChecksum = parseInt(checksumField, 8);
+    let sum = 0;
+    for (let i = 0; i < 512; i++) sum += i >= 148 && i < 156 ? 32 /* space, per spec */ : header[i];
+    if (!Number.isNaN(expectedChecksum) && sum !== expectedChecksum) {
+      throw new Error(`Downloaded archive is corrupt (bad tar header checksum at offset ${offset}).`);
+    }
+
+    const fullName = prefix ? `${prefix}/${name}` : name;
+    const dataStart = offset + 512;
+    const dataEnd = dataStart + size;
+
+    if (typeFlag === '0' || typeFlag === '\0') {
+      entries.push({ name: fullName, data: buf.subarray(dataStart, dataEnd) });
+    }
+    // typeFlag '5' (directory) and others are skipped — our archive is a flat
+    // file list and fs.mkdirSync(..., { recursive: true }) below creates any
+    // parent directories a file entry needs regardless of whether the
+    // archive also carries explicit directory entries for them.
+
+    offset = dataStart + Math.ceil(size / 512) * 512;
+  }
+
+  return entries;
+}
+
+function extractTarGz(buffer) {
+  let tarBuf;
+  try {
+    tarBuf = zlib.gunzipSync(buffer);
+  } catch (err) {
+    throw new Error(`Downloaded archive is not valid gzip: ${err.message}`);
+  }
+  return parseTarBuffer(tarBuf);
+}
+
+function publishCacheDir(tempDir, finalDir, expectedHex, version) {
+  try {
+    fs.renameSync(tempDir, finalDir);
+  } catch (err) {
+    // Another launcher instance may have installed this exact version first
+    // (two Claude Code windows starting at once). Re-check ground truth
+    // rather than assuming our rename losing the race means real failure.
+    if (isCacheReady(finalDir, expectedHex)) {
+      logError(`[code-index] Server v${version} was installed by a concurrent process — using it.`);
+      return;
+    }
+    throw err;
+  }
+}
+
+async function installServerVersion(version, expected, cacheDir) {
+  const token = resolveGitHubToken();
+
+  logError(`[code-index] Server v${version} not found in local cache — downloading from GitHub Releases (~14 MB, one-time)...`);
+
+  const asset = await resolveReleaseAsset(version, token);
+  const buffer = await downloadAssetBuffer(asset.id, token, asset.size);
+
+  logError('[code-index] Verifying checksum...');
+  const actualHex = crypto.createHash('sha256').update(buffer).digest('hex');
+  if (actualHex.toLowerCase() !== expected.hex.toLowerCase()) {
+    throw new ChecksumMismatchError(expected.hex, actualHex);
+  }
+  logError('[code-index] Checksum OK — extracting...');
+
+  const entries = extractTarGz(buffer);
+
+  const tempDir = path.join(
+    SERVER_CACHE_ROOT,
+    `.tmp-install-${version}-${process.pid}-${crypto.randomBytes(4).toString('hex')}`,
+  );
+  fs.mkdirSync(tempDir, { recursive: true });
+
+  try {
+    for (const entry of entries) {
+      const target = path.join(tempDir, entry.name);
+      fs.mkdirSync(path.dirname(target), { recursive: true });
+      fs.writeFileSync(target, entry.data);
+    }
+    // Written last, inside the temp dir, so it only ever appears at the
+    // final path as part of the one atomic rename below — never before the
+    // rest of the extraction has finished.
+    fs.writeFileSync(path.join(tempDir, VERIFIED_MARKER_NAME), expected.hex, 'utf8');
+    publishCacheDir(tempDir, cacheDir, expected.hex, version);
+  } finally {
+    removeDirBestEffort(tempDir); // no-op once renamed away
+  }
+
+  logError(`[code-index] Server v${version} installed at ${cacheDir}${path.sep}`);
+}
+
+function logInstallError(version, expected, err) {
+  const assetUrl = assetDownloadUrl(version);
+  const cacheDir = cacheDirFor(version);
+
+  if (err instanceof NetworkError) {
+    logError(
+      `[code-index] Server v${version} is not installed yet, and GitHub could not be reached to download it.`,
+      `[code-index] Network error: ${err.message}`,
+      '',
+      '[code-index] Check your internet connection and try again. If you are offline, download the release',
+      '[code-index] manually and extract it into the folder below:',
+      '',
+      `  ${assetUrl}`,
+      '',
+      `  ${cacheDir}${path.sep}`,
+      '',
+      '[code-index] Then ask your question again — the launcher will find it there and skip the download.',
+    );
+    return;
+  }
+
+  if (err instanceof ChecksumMismatchError) {
+    logError(
+      `[code-index] Downloaded server v${version} but its checksum does not match — refusing to run it.`,
+      `[code-index]   expected: ${err.expected}`,
+      `[code-index]   actual:   ${err.actual}`,
+      '',
+      '[code-index] This usually means a corrupted download or a compromised release asset. The file was',
+      '[code-index] not installed. Try again; if this keeps happening, please report it:',
+      '',
+      `  ${GITHUB_ISSUES_URL}`,
+    );
+    return;
+  }
+
+  if (err instanceof HttpStatusError && err.status === 404) {
+    logError(
+      `[code-index] No GitHub release found for server v${version} (tag ${releaseTag(version)}).`,
+      '',
+      '[code-index] This plugin build expects a matching server release that is not published — check',
+      `[code-index]   https://github.com/${RELEASE_OWNER}/${RELEASE_REPO}/releases`,
+      '[code-index] for available versions, or download it manually once published:',
+      '',
+      `  ${assetUrl}`,
+    );
+    return;
+  }
+
+  if (err instanceof HttpStatusError && (err.status === 401 || err.status === 403)) {
+    logError(
+      `[code-index] GitHub returned ${err.status} while requesting the server v${version} release.`,
+      '[code-index] This repository is private and needs authentication to download release assets.',
+      '',
+      "[code-index] Provide a token with 'repo' scope one of these ways:",
+      '[code-index]   - set CODEINDEX_GITHUB_TOKEN (or GH_TOKEN / GITHUB_TOKEN) in your environment, or',
+      '[code-index]   - authenticate the GitHub CLI (`gh auth login`) — the launcher borrows its token automatically',
+      '',
+      '[code-index] Or download the asset manually with your browser and extract it into:',
+      '',
+      `  ${cacheDir}${path.sep}`,
+      '',
+      `  ${assetUrl}`,
+    );
+    return;
+  }
+
+  if (err && err.code === 'ASSET_NOT_IN_RELEASE') {
+    logError(
+      `[code-index] Release ${err.tag} exists but does not contain ${assetFileName(version)}.`,
+      `[code-index] See ${releasePageUrl(version)} for what it does contain — the CI publish step may still be running.`,
+    );
+    return;
+  }
+
+  logError(
+    `[code-index] Could not install server v${version}: ${err && err.message ? err.message : err}`,
+    `[code-index] Manual fallback — download and extract into ${cacheDir}${path.sep}:`,
+    '',
+    `  ${assetUrl}`,
+  );
+}
+
+/** Resolves the directory containing CodeIndex.Server.dll for this session,
+ * fetching and caching it from GitHub Releases if it isn't already present.
+ * Exits the process (never returns) on any failure — every path here is a
+ * precondition for starting the server at all. */
+async function ensureServerInstalled() {
+  const devOverride = process.env.CODEINDEX_SERVER_DIR;
+  if (devOverride) {
+    const dll = path.join(devOverride, 'CodeIndex.Server.dll');
+    if (!fs.existsSync(dll)) {
+      logError(
+        `[code-index] CODEINDEX_SERVER_DIR is set to ${devOverride}, but ${dll} does not exist.`,
+        '[code-index] Point it at a published CodeIndex.Server build directory, or unset it to use the normal download path.',
+      );
+      process.exit(2);
+    }
+    logError(`[code-index] Using local server build at ${devOverride} (CODEINDEX_SERVER_DIR override — no download, no verification).`);
+    return devOverride;
+  }
+
+  let manifest;
+  try {
+    manifest = JSON.parse(fs.readFileSync(PLUGIN_MANIFEST_PATH, 'utf8'));
+  } catch (err) {
+    logError(`[code-index] Could not read plugin manifest (${PLUGIN_MANIFEST_PATH}): ${err.message}`);
+    process.exit(2);
+  }
+
+  const version = manifest.serverVersion;
+  if (!version) {
+    logError('[code-index] Plugin manifest is missing "serverVersion" — this plugin build cannot resolve which server to run.');
+    process.exit(2);
+  }
+
+  let expected;
+  try {
+    expected = readExpectedChecksum(version);
+  } catch (err) {
+    logError(`[code-index] ${err.message}`);
+    process.exit(2);
+  }
+
+  const cacheDir = cacheDirFor(version);
+  if (isCacheReady(cacheDir, expected.hex)) {
+    return cacheDir; // fast path — already installed, no network at all
+  }
+
+  try {
+    fs.mkdirSync(SERVER_CACHE_ROOT, { recursive: true });
+    sweepStaleTempDirs();
+    await installServerVersion(version, expected, cacheDir);
+    return cacheDir;
+  } catch (err) {
+    logInstallError(version, expected, err);
+    process.exit(2);
+  }
+}
+
 // ── Spawn the real server ────────────────────────────────────────────────────
 
-function runServer(env) {
-  if (!fs.existsSync(SERVER_DLL)) {
+function runServer(env, serverDir) {
+  const serverDll = path.join(serverDir, 'CodeIndex.Server.dll');
+  if (!fs.existsSync(serverDll)) {
     logError(
-      `[code-index] Server assembly not found: ${SERVER_DLL}`,
-      '[code-index] Was this plugin installed correctly? Expected layout: bin/server/CodeIndex.Server.dll',
+      `[code-index] Server assembly not found: ${serverDll}`,
+      '[code-index] The installed server directory looks incomplete or corrupted — delete it and retry:',
+      '',
+      `  ${serverDir}`,
     );
     process.exit(2);
   }
 
-  const args = [SERVER_DLL, ...process.argv.slice(2)];
+  const args = [serverDll, ...process.argv.slice(2)];
   const child = spawn('dotnet', args, { stdio: 'inherit', env });
 
   child.on('exit', (code, signal) => {
@@ -284,7 +854,7 @@ function runServer(env) {
   });
 
   child.on('error', (err) => {
-    logError(`[code-index] Failed to spawn dotnet ${SERVER_DLL}: ${err.message}`);
+    logError(`[code-index] Failed to spawn dotnet ${serverDll}: ${err.message}`);
     process.exit(3);
   });
 
@@ -308,19 +878,56 @@ async function main() {
 
   if (!checkProjectConfigured(env)) process.exit(2);
 
+  // Runs after the cheap, network-free checks above so a broken/unconfigured
+  // install fails fast without spending bandwidth on a 14 MB download it
+  // wouldn't have needed anyway.
+  const serverDir = await ensureServerInstalled();
+
   let ollamaOk;
   try {
-    ollamaOk = await checkOllama(env);
+    ollamaOk = await checkOllama(env, serverDir);
   } catch (err) {
     logError(`[code-index] ${err.message}`);
     process.exit(2);
   }
   if (!ollamaOk) process.exit(2);
 
-  runServer(env);
+  runServer(env, serverDir);
 }
 
-main().catch((err) => {
-  logError(`[code-index] Unexpected launcher error: ${err && err.stack ? err.stack : err}`);
-  process.exit(1);
-});
+if (require.main === module) {
+  main().catch((err) => {
+    logError(`[code-index] Unexpected launcher error: ${err && err.stack ? err.stack : err}`);
+    process.exit(1);
+  });
+}
+
+// Exported for server.test.js. Everything here is pure/deterministic (no
+// network, no process.exit) so it can be unit-tested without spinning up a
+// GitHub release or a .NET runtime; the network-touching orchestration
+// (installServerVersion, ensureServerInstalled, main) is exercised instead
+// via CODEINDEX_SERVER_DIR / a real cache directory in integration checks.
+module.exports = {
+  releaseTag,
+  assetFileName,
+  releasePageUrl,
+  assetDownloadUrl,
+  cacheDirFor,
+  readExpectedChecksum,
+  isCacheReady,
+  publishCacheDir,
+  parseTarBuffer,
+  extractTarGz,
+  readCString,
+  buildGithubHeaders,
+  NetworkError,
+  HttpStatusError,
+  ChecksumMismatchError,
+  logInstallError,
+  VERIFIED_MARKER_NAME,
+  SERVER_CACHE_ROOT,
+  CHECKSUM_FILE_PATH,
+  PLUGIN_MANIFEST_PATH,
+  RELEASE_OWNER,
+  RELEASE_REPO,
+};

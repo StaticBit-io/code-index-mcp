@@ -1,0 +1,117 @@
+name: Release Server
+
+# Publishes the code-index-mcp server as a GitHub Release asset, so
+# plugins/code-index/bin/server.js can fetch it on demand instead of the
+# repository carrying a 14 MB committed build. Triggered by pushing a tag
+# named "server-v<version>" (e.g. server-v0.2.0) — that version must match
+# the "serverVersion" field in plugins/code-index/.claude-plugin/plugin.json,
+# and the sha256 this job prints must match plugins/code-index/bin/server.sha256
+# committed at that same ref; the launcher refuses to run a mismatched build.
+
+on:
+  push:
+    tags:
+      - 'server-v*.*.*'
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    name: Build & publish release asset
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - name: Derive version from tag
+        id: version
+        run: |
+          tag="${GITHUB_REF_NAME}"
+          echo "version=${tag#server-v}" >> "$GITHUB_OUTPUT"
+          echo "tag=${tag}" >> "$GITHUB_OUTPUT"
+
+      - name: Setup .NET
+        uses: actions/setup-dotnet@v4
+        with:
+          global-json-file: global.json
+
+      - name: Restore
+        run: dotnet restore src/CodeIndex.Server/CodeIndex.Server.csproj
+
+      # Portable, framework-dependent publish (no -r/RuntimeIdentifier): a
+      # single build runs under `dotnet CodeIndex.Server.dll` on any OS with
+      # a matching .NET 10 runtime — see CodeIndex.Core.csproj, there's no
+      # native/AOT dependency anywhere in the graph.
+      #   - UseAppHost=false skips the OS-native apphost stub
+      #     (CodeIndex.Server[.exe]), which the launcher never uses (it
+      #     always runs `dotnet <dll>` directly) and which would otherwise be
+      #     the one platform-specific binary in an archive meant to be
+      #     portable.
+      #   - SatelliteResourceLanguages=en drops the per-locale Roslyn
+      #     resource assemblies (cs/, de/, es/, ... one folder per language)
+      #     that a default publish generates — those are exactly the
+      #     "carries the build machine's fingerprint" assemblies the switch
+      #     to CI is meant to eliminate, and the server only ever logs
+      #     English text to begin with.
+      #   - DebugType=embedded folds the PDB into the DLL instead of
+      #     shipping it as a second loose file (still keeps line numbers in
+      #     stack traces).
+      #   - GenerateDocumentationFile=false drops the IntelliSense XML docs,
+      #     which are meaningless for a runtime deployment (Directory.Build.props
+      #     enables them for the *build*, where they matter for IDE tooling).
+      - name: Publish portable server
+        run: >
+          dotnet publish src/CodeIndex.Server/CodeIndex.Server.csproj
+          -c Release
+          -o publish/server
+          -p:UseAppHost=false
+          -p:SatelliteResourceLanguages=en
+          -p:DebugType=embedded
+          -p:GenerateDocumentationFile=false
+          --no-restore
+
+      - name: Package archive
+        id: package
+        run: |
+          set -euo pipefail
+          version="${{ steps.version.outputs.version }}"
+          asset="code-index-server-${version}.tar.gz"
+          workspace="$(pwd)"
+          # Archive from *inside* the publish directory with a glob (rather
+          # than `tar -C dir .`) so entries land as flat top-level names
+          # (CodeIndex.Server.dll, not ./CodeIndex.Server.dll or a "./"
+          # directory entry) — bin/server.js's hand-rolled tar reader only
+          # needs to handle exactly that shape.
+          (cd publish/server && tar czf "${workspace}/${asset}" *)
+          sha256sum "${asset}" > "${asset}.sha256"
+          echo "asset=${asset}" >> "$GITHUB_OUTPUT"
+          echo "--- checksum ---"
+          cat "${asset}.sha256"
+
+      - name: Create GitHub Release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: >
+          gh release create "${{ steps.version.outputs.tag }}"
+          "${{ steps.package.outputs.asset }}"
+          "${{ steps.package.outputs.asset }}.sha256"
+          --repo "${{ github.repository }}"
+          --title "code-index server v${{ steps.version.outputs.version }}"
+          --notes "Portable, framework-dependent CodeIndex.Server build for code-index-mcp plugin v${{ steps.version.outputs.version }}. Fetched automatically by plugins/code-index/bin/server.js — see plugins/code-index/bin/server.sha256 in the repository for the checksum this build must match."
+
+      - name: Summary
+        run: |
+          {
+            echo "### Server release — ${{ steps.version.outputs.tag }}"
+            echo ""
+            echo "Asset: \`${{ steps.package.outputs.asset }}\`"
+            echo ""
+            echo '```'
+            cat "${{ steps.package.outputs.asset }}.sha256"
+            echo '```'
+            echo ""
+            echo "Confirm this matches \`plugins/code-index/bin/server.sha256\` on this ref before merging/tagging further."
+          } >> "$GITHUB_STEP_SUMMARY"
