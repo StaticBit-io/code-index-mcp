@@ -325,6 +325,24 @@ const STALE_TEMP_MAX_AGE_MS = 60 * 60 * 1000; // 1 hour
 const SERVER_CACHE_ROOT = path.join(os.homedir(), '.code-index-mcp', 'server');
 const VERIFIED_MARKER_NAME = '.verified-sha256';
 
+/** Thrown (never `process.exit()`ed directly) by every failure path that can
+ * run after a `fetch()` call in this process. On this Node/Windows
+ * combination, calling `process.exit()` shortly after any fetch — even a
+ * completed, successfully-cleaned-up one — reliably crashes the process
+ * with a libuv assertion (`UV_HANDLE_CLOSING`) instead of exiting with the
+ * intended code, because undici's connection-pool teardown races the
+ * synchronous exit. Throwing this and letting `main()`'s single top-level
+ * catch set `process.exitCode` and return avoids calling `process.exit()`
+ * at all on that path, which sidesteps the race entirely (verified: the
+ * same fetch-then-`process.exitCode = n`-then-return sequence does not
+ * crash, where fetch-then-`process.exit(n)` reliably does). */
+class LauncherExit extends Error {
+  constructor(code) {
+    super(`launcher exit ${code}`);
+    this.code = code;
+  }
+}
+
 class NetworkError extends Error {}
 
 class HttpStatusError extends Error {
@@ -784,7 +802,7 @@ async function ensureServerInstalled() {
         `[code-index] CODEINDEX_SERVER_DIR is set to ${devOverride}, but ${dll} does not exist.`,
         '[code-index] Point it at a published CodeIndex.Server build directory, or unset it to use the normal download path.',
       );
-      process.exit(2);
+      throw new LauncherExit(2);
     }
     logError(`[code-index] Using local server build at ${devOverride} (CODEINDEX_SERVER_DIR override — no download, no verification).`);
     return devOverride;
@@ -795,13 +813,13 @@ async function ensureServerInstalled() {
     manifest = JSON.parse(fs.readFileSync(PLUGIN_MANIFEST_PATH, 'utf8'));
   } catch (err) {
     logError(`[code-index] Could not read plugin manifest (${PLUGIN_MANIFEST_PATH}): ${err.message}`);
-    process.exit(2);
+    throw new LauncherExit(2);
   }
 
   const version = manifest.serverVersion;
   if (!version) {
     logError('[code-index] Plugin manifest is missing "serverVersion" — this plugin build cannot resolve which server to run.');
-    process.exit(2);
+    throw new LauncherExit(2);
   }
 
   let expected;
@@ -809,7 +827,7 @@ async function ensureServerInstalled() {
     expected = readExpectedChecksum(version);
   } catch (err) {
     logError(`[code-index] ${err.message}`);
-    process.exit(2);
+    throw new LauncherExit(2);
   }
 
   const cacheDir = cacheDirFor(version);
@@ -823,8 +841,9 @@ async function ensureServerInstalled() {
     await installServerVersion(version, expected, cacheDir);
     return cacheDir;
   } catch (err) {
+    if (err instanceof LauncherExit) throw err;
     logInstallError(version, expected, err);
-    process.exit(2);
+    throw new LauncherExit(2);
   }
 }
 
@@ -839,7 +858,7 @@ function runServer(env, serverDir) {
       '',
       `  ${serverDir}`,
     );
-    process.exit(2);
+    throw new LauncherExit(2);
   }
 
   const args = [serverDll, ...process.argv.slice(2)];
@@ -866,17 +885,17 @@ function runServer(env, serverDir) {
 }
 
 async function main() {
-  if (!checkDotnetRuntime()) process.exit(2);
+  if (!checkDotnetRuntime()) throw new LauncherExit(2);
 
   let env;
   try {
     env = buildChildEnv();
   } catch (err) {
     logError(`[code-index] ${err.message}`);
-    process.exit(2);
+    throw new LauncherExit(2);
   }
 
-  if (!checkProjectConfigured(env)) process.exit(2);
+  if (!checkProjectConfigured(env)) throw new LauncherExit(2);
 
   // Runs after the cheap, network-free checks above so a broken/unconfigured
   // install fails fast without spending bandwidth on a 14 MB download it
@@ -888,17 +907,33 @@ async function main() {
     ollamaOk = await checkOllama(env, serverDir);
   } catch (err) {
     logError(`[code-index] ${err.message}`);
-    process.exit(2);
+    throw new LauncherExit(2);
   }
-  if (!ollamaOk) process.exit(2);
+  if (!ollamaOk) throw new LauncherExit(2);
 
   runServer(env, serverDir);
 }
 
 if (require.main === module) {
   main().catch((err) => {
+    // Every known failure path above throws LauncherExit instead of calling
+    // process.exit() directly — see its class comment for why: on this
+    // Node/Windows combination, process.exit() shortly after any fetch()
+    // call in the process (the GitHub API/download calls almost always ran
+    // by the time anything here fails) reliably crashes with a libuv
+    // assertion instead of exiting with the intended code. Setting
+    // process.exitCode and returning lets Node exit on its own once the
+    // event loop drains, which does not race that teardown. (runServer's
+    // child process exit/error handlers are the one place that still call
+    // process.exit() directly — by then SIGINT/SIGTERM/SIGHUP listeners are
+    // registered, which keep the event loop alive on their own, so an
+    // explicit exit is genuinely required there, not just convenient.)
+    if (err instanceof LauncherExit) {
+      process.exitCode = err.code;
+      return;
+    }
     logError(`[code-index] Unexpected launcher error: ${err && err.stack ? err.stack : err}`);
-    process.exit(1);
+    process.exitCode = 1;
   });
 }
 
@@ -920,6 +955,7 @@ module.exports = {
   extractTarGz,
   readCString,
   buildGithubHeaders,
+  LauncherExit,
   NetworkError,
   HttpStatusError,
   ChecksumMismatchError,

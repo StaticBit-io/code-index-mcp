@@ -188,6 +188,38 @@ test('extractTarGz rejects a corrupted (non-gzip) buffer with a clear error, not
   assert.throws(() => srv.extractTarGz(Buffer.from('not gzip data at all')), /not valid gzip/);
 });
 
+test('every failure path in ensureServerInstalled/runServer throws LauncherExit rather than calling process.exit() directly', () => {
+  // Regression test: on this Node/Windows combination, calling
+  // process.exit() shortly after a fetch() call in the same process
+  // reliably crashes with a libuv assertion (verified against a live
+  // GitHub API call — see the LauncherExit class comment and CHANGELOG for
+  // the repro). Every throw site that can run after ensureServerInstalled
+  // has made a network call must go through LauncherExit instead, so
+  // main()'s single catch can set process.exitCode and return without ever
+  // calling process.exit() itself. This can't run those code paths without
+  // a real cache/manifest/network fixture (covered by the manual
+  // integration checks instead), but it does pin down the invariant that
+  // matters: no raw `process.exit(` call sites exist outside runServer's
+  // child-process event handlers, where it's registered signal listeners
+  // (not a recent fetch) that make an explicit exit necessary.
+  const source = fs.readFileSync(path.join(__dirname, 'server.js'), 'utf8');
+  const isCommentLine = (line) => line.startsWith('//') || line.startsWith('*') || line.startsWith('/**');
+  const exitCallLines = source
+    .split('\n')
+    .map((line, i) => ({ line: line.trim(), n: i + 1 }))
+    .filter(({ line }) => /\bprocess\.exit\(/.test(line) && !isCommentLine(line));
+
+  const allowedContext = ["process.exit(code ?? 0);", "process.exit(3);"];
+  const unexpected = exitCallLines.filter(({ line }) => !allowedContext.includes(line));
+
+  assert.deepEqual(
+    unexpected,
+    [],
+    `unexpected process.exit() call site(s) outside the child-process event handlers: ${JSON.stringify(unexpected)}`,
+  );
+  assert.equal(exitCallLines.length, 2, 'expected exactly the two child.on(exit)/child.on(error) call sites');
+});
+
 test('a real CI-shaped archive (this repo\'s own build, packaged the way the workflow does) parses correctly and its checksum matches sha256sum', { skip: !process.env.CODEINDEX_TEST_ARCHIVE }, () => {
   const archivePath = process.env.CODEINDEX_TEST_ARCHIVE;
   const buffer = fs.readFileSync(archivePath);
