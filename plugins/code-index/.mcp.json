@@ -1,0 +1,14 @@
+{
+  "mcpServers": {
+    "code-index": {
+      "type": "stdio",
+      "command": "node",
+      "args": ["${CLAUDE_PLUGIN_ROOT}/bin/server.js"],
+      "env": {
+        "CODEINDEX_CONFIG_FILE": "${CODEINDEX_CONFIG_FILE}",
+        "CODEINDEX_Embedding__Endpoint": "${CODEINDEX_Embedding__Endpoint}",
+        "CODEINDEX_Embedding__Model": "${CODEINDEX_Embedding__Model}"
+      }
+    }
+  }
+}

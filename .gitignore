@@ -30,3 +30,8 @@ appsettings.Local.json
 ## OS
 Thumbs.db
 .DS_Store
+
+## The plugin's bin/ is a committed deliverable (published server + launcher),
+## not a build output directory — un-ignore it despite the blanket "bin/" rule above.
+!/plugins/**/bin/
+!/plugins/**/bin/**
