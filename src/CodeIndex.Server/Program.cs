@@ -165,7 +165,20 @@ public static class Program
             CodeIndexService service = registry.GetService(projectId);
 
             Stopwatch stopwatch = Stopwatch.StartNew();
-            IndexSnapshot snapshot = await service.RebuildAsync();
+            IndexSnapshot snapshot;
+            try
+            {
+                snapshot = await service.RebuildAsync();
+            }
+            catch (EmbeddingUnavailableException ex)
+            {
+                // Matches this method's own contract (see remarks above): an embedder that is
+                // down for this project must be reported and skipped, not let this exception
+                // reach RunGuardedAsync and abort every remaining project in the loop.
+                Console.WriteLine($"  Error: {ex.Message}");
+                continue;
+            }
+
             stopwatch.Stop();
 
             Console.WriteLine("  Rebuild complete.");
