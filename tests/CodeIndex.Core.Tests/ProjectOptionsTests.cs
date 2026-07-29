@@ -39,11 +39,67 @@ public sealed class ProjectOptionsTests
     [InlineData("foo..bar")]
     [InlineData("bad:name")]
     [InlineData("bad*name")]
+    [InlineData("foo.")]
+    [InlineData("foo ")]
+    [InlineData("CON")]
+    [InlineData("con")]
+    [InlineData("NUL")]
+    [InlineData("nul.txt")]
+    [InlineData("COM1")]
+    [InlineData("com1.log")]
+    [InlineData("LPT1")]
     public void ResolveCacheDirectory_ThrowsForAnUnsafeId(string id)
     {
         ProjectOptions options = new() { Id = id };
 
         Assert.Throws<ArgumentException>(() => options.ResolveCacheDirectory());
+    }
+
+    [Fact]
+    public void ValidateId_ThrowsForATrailingDotEvenThoughWindowsWouldSilentlyNormalizeIt()
+    {
+        // "foo" and "foo." would resolve to the same directory on Windows (which strips trailing
+        // dots/spaces) but are two distinct, non-colliding ids on Linux/macOS -- rejecting the
+        // trailing dot keeps validation OS-independent instead of only catching the collision on
+        // whichever OS the server happens to run on.
+        ProjectOptions options = new() { Id = "foo." };
+
+        Assert.Throws<ArgumentException>(() => options.ValidateId());
+    }
+
+    [Theory]
+    [InlineData("CON")]
+    [InlineData("Con")]
+    [InlineData("PRN")]
+    [InlineData("AUX")]
+    [InlineData("NUL")]
+    [InlineData("COM1")]
+    [InlineData("COM9")]
+    [InlineData("LPT1")]
+    [InlineData("nul.log")]
+    public void ValidateId_ThrowsForAWindowsReservedDeviceNameOnEveryOs(string id)
+    {
+        // Rejected unconditionally, not just on Windows -- see ValidateId remarks: an id that
+        // validates on Linux and only breaks when the same cache is later used on Windows would
+        // defeat the whole point of validating up front.
+        ProjectOptions options = new() { Id = id };
+
+        Assert.Throws<ArgumentException>(() => options.ValidateId());
+    }
+
+    [Theory]
+    [InlineData("CONcat")]
+    [InlineData("Console")]
+    [InlineData("NULL")]
+    [InlineData("COM10")]
+    [InlineData("scomm1")]
+    public void ValidateId_AcceptsIdsThatMerelyContainAReservedNameAsASubstring(string id)
+    {
+        // Only an exact match (case-insensitive) up to the first '.' is reserved -- a name that
+        // merely starts with or contains one of the reserved words must still validate.
+        ProjectOptions options = new() { Id = id };
+
+        options.ValidateId();
     }
 
     [Theory]

@@ -61,6 +61,18 @@ public sealed class ProjectOptions
     }
 
     /// <summary>
+    /// Windows device names reserved regardless of extension (<c>NUL</c> and <c>NUL.txt</c> are
+    /// both reserved) — checked case-insensitively and on every platform (see <see cref="ValidateId"/>
+    /// remarks on why <see cref="Id"/> validation is deliberately OS-independent).
+    /// </summary>
+    private static readonly string[] ReservedWindowsNames =
+    [
+        "CON", "PRN", "AUX", "NUL",
+        "COM1", "COM2", "COM3", "COM4", "COM5", "COM6", "COM7", "COM8", "COM9",
+        "LPT1", "LPT2", "LPT3", "LPT4", "LPT5", "LPT6", "LPT7", "LPT8", "LPT9",
+    ];
+
+    /// <summary>
     /// Resolves the directory this project's on-disk index cache lives in: <see cref="CacheDirectory"/>
     /// verbatim if set, otherwise <c>%LocalAppData%/code-index-mcp/&lt;Id&gt;</c>.
     /// </summary>
@@ -134,6 +146,31 @@ public sealed class ProjectOptions
             throw new ArgumentException(
                 $"{nameof(Id)} contains a character that is not valid in a file or directory name " +
                 $"('{Id[invalidCharIndex]}'), but was '{Id}'.", nameof(Id));
+        }
+
+        // Windows silently strips trailing dots/spaces when it creates a directory, so "foo",
+        // "foo." and "foo " would all resolve to the same cache directory there while staying
+        // three distinct, non-colliding ids on Linux/macOS. Rejecting the trailing dot/space
+        // keeps Id validation OS-independent instead of only catching the collision on whichever
+        // OS the server happens to run on.
+        if (Id.Length != Id.TrimEnd('.', ' ').Length)
+        {
+            throw new ArgumentException(
+                $"{nameof(Id)} must not end with '.' or ' ' (Windows normalizes these away from " +
+                $"directory names, which would collide with the trimmed id), but was '{Id}'.", nameof(Id));
+        }
+
+        // Windows reserves these names for device files regardless of extension ("NUL" and
+        // "NUL.log" are both reserved) and refuses to create a directory with one, on every
+        // drive — checked unconditionally, not just on Windows, for the same portability reason
+        // as the rest of this method.
+        int dotIndex = Id.IndexOf('.', StringComparison.Ordinal);
+        string reservedNameCandidate = dotIndex >= 0 ? Id[..dotIndex] : Id;
+        if (Array.Exists(ReservedWindowsNames, name => string.Equals(name, reservedNameCandidate, StringComparison.OrdinalIgnoreCase)))
+        {
+            throw new ArgumentException(
+                $"{nameof(Id)} must not be a Windows-reserved device name ('{reservedNameCandidate}'), " +
+                $"even on non-Windows platforms, so cache directories stay portable, but was '{Id}'.", nameof(Id));
         }
     }
 }
