@@ -815,8 +815,10 @@ function logInstallError(version, expected, err) {
 
 /** Resolves the directory containing CodeIndex.Server.dll for this session,
  * fetching and caching it from GitHub Releases if it isn't already present.
- * Exits the process (never returns) on any failure — every path here is a
- * precondition for starting the server at all. */
+ * Throws LauncherExit(2) on any failure — every path here is a precondition
+ * for starting the server at all; main()'s top-level catch sets
+ * process.exitCode and returns rather than calling process.exit() directly
+ * (see the LauncherExit class comment for why). */
 async function ensureServerInstalled() {
   const devOverride = process.env.CODEINDEX_SERVER_DIR;
   if (devOverride) {
