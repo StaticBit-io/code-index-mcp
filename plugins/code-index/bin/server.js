@@ -651,6 +651,34 @@ function extractTarGz(buffer) {
   return parseTarBuffer(tarBuf);
 }
 
+/** Writes extracted tar entries under destDir, refusing (zip-slip) any entry
+ * whose name would resolve outside destDir — an absolute path (`/etc/passwd`,
+ * `C:\Windows\...`) or a `../` traversal. The sha256 check in
+ * installServerVersion runs before this and is the primary trust boundary,
+ * but this is the actual write path, so it gets its own independent check
+ * rather than relying solely on the checksum holding forever (a future
+ * caller of this function, or a relaxed check, shouldn't silently regain the
+ * ability to write outside destDir). parseTarBuffer already drops anything
+ * that isn't a regular file (typeFlag '0'/'\0'), so symlink entries never
+ * reach here in the first place. Throws and writes nothing further on the
+ * first bad entry — a hostile archive is refused outright, not partially
+ * extracted with the bad entry skipped. */
+function extractEntriesTo(entries, destDir) {
+  const destRoot = path.resolve(destDir);
+  for (const entry of entries) {
+    if (path.isAbsolute(entry.name)) {
+      throw new Error(`Downloaded archive contains an unsafe entry path: ${entry.name}`);
+    }
+    const target = path.resolve(destRoot, entry.name);
+    const rel = path.relative(destRoot, target);
+    if (rel.startsWith('..') || path.isAbsolute(rel)) {
+      throw new Error(`Downloaded archive contains an unsafe entry path: ${entry.name}`);
+    }
+    fs.mkdirSync(path.dirname(target), { recursive: true });
+    fs.writeFileSync(target, entry.data);
+  }
+}
+
 function publishCacheDir(tempDir, finalDir, expectedHex, version) {
   try {
     fs.renameSync(tempDir, finalDir);
@@ -690,11 +718,7 @@ async function installServerVersion(version, expected, cacheDir) {
   fs.mkdirSync(tempDir, { recursive: true });
 
   try {
-    for (const entry of entries) {
-      const target = path.join(tempDir, entry.name);
-      fs.mkdirSync(path.dirname(target), { recursive: true });
-      fs.writeFileSync(target, entry.data);
-    }
+    extractEntriesTo(entries, tempDir);
     // Written last, inside the temp dir, so it only ever appears at the
     // final path as part of the one atomic rename below — never before the
     // rest of the extraction has finished.
@@ -953,6 +977,7 @@ module.exports = {
   publishCacheDir,
   parseTarBuffer,
   extractTarGz,
+  extractEntriesTo,
   readCString,
   buildGithubHeaders,
   LauncherExit,

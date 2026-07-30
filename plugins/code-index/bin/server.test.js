@@ -188,6 +188,67 @@ test('extractTarGz rejects a corrupted (non-gzip) buffer with a clear error, not
   assert.throws(() => srv.extractTarGz(Buffer.from('not gzip data at all')), /not valid gzip/);
 });
 
+test('extractEntriesTo (zip-slip) refuses a hostile archive whose entry escapes destDir via ../ traversal', (t) => {
+  // Build a real tar.gz — the same code path a hostile release asset would
+  // take through downloadAssetBuffer -> extractTarGz -> extractEntriesTo —
+  // rather than hand-constructing an entries array, so this exercises the
+  // actual bytes-to-disk pipeline, not just the guard function in isolation.
+  const dir = mkTempDir(t, 'code-index-zipslip-archive-');
+  const destDir = path.join(dir, 'dest');
+  fs.mkdirSync(destDir, { recursive: true });
+
+  const files = { '../evil.txt': Buffer.from('pwned') };
+  const gz = zlib.gzipSync(buildMinimalTar(files));
+
+  const entries = srv.extractTarGz(gz);
+  assert.throws(() => srv.extractEntriesTo(entries, destDir), /unsafe entry path/);
+  assert.equal(fs.existsSync(path.join(dir, 'evil.txt')), false, 'traversal entry must not land outside destDir');
+  assert.equal(fs.existsSync(path.join(destDir, '..', 'evil.txt')), false);
+});
+
+test('extractEntriesTo (zip-slip) refuses an absolute entry path', (t) => {
+  const dir = mkTempDir(t, 'code-index-zipslip-abs-');
+  const destDir = path.join(dir, 'dest');
+  fs.mkdirSync(destDir, { recursive: true });
+  const outsideTarget = path.join(dir, 'outside-abs.txt');
+
+  assert.throws(
+    () => srv.extractEntriesTo([{ name: outsideTarget, data: Buffer.from('pwned') }], destDir),
+    /unsafe entry path/,
+  );
+  assert.equal(fs.existsSync(outsideTarget), false);
+});
+
+test('extractEntriesTo still writes legitimate nested entries inside destDir', (t) => {
+  const dir = mkTempDir(t, 'code-index-zipslip-ok-');
+  const destDir = path.join(dir, 'dest');
+  fs.mkdirSync(destDir, { recursive: true });
+
+  srv.extractEntriesTo(
+    [
+      { name: 'CodeIndex.Server.dll', data: Buffer.from('dll-bytes') },
+      { name: 'nested/sub/file.txt', data: Buffer.from('nested content') },
+    ],
+    destDir,
+  );
+
+  assert.equal(fs.readFileSync(path.join(destDir, 'CodeIndex.Server.dll'), 'utf8'), 'dll-bytes');
+  assert.equal(fs.readFileSync(path.join(destDir, 'nested', 'sub', 'file.txt'), 'utf8'), 'nested content');
+});
+
+test('parseTarBuffer already drops symlink entries, so extractEntriesTo never sees a symlink escaping destDir', () => {
+  // typeFlag '2' is a symlink per the tar spec; parseTarBuffer only pushes
+  // typeFlag '0'/'\0' (regular file) entries into its result — this pins
+  // down that a symlink entry pointing outside the archive (e.g. linking
+  // "safe-name" to "../../etc") can never reach extractEntriesTo at all.
+  const header = buildTarHeader('escape-link', 0, { typeFlag: '2', linkname: '../../outside' });
+  const tarBuf = Buffer.concat([header, Buffer.alloc(1024)]);
+  const gz = zlib.gzipSync(tarBuf);
+
+  const entries = srv.extractTarGz(gz);
+  assert.equal(entries.length, 0, 'symlink entry must not be surfaced as an extractable entry');
+});
+
 test('every failure path in ensureServerInstalled/runServer throws LauncherExit rather than calling process.exit() directly', () => {
   // Regression test: on this Node/Windows combination, calling
   // process.exit() shortly after a fetch() call in the same process
@@ -251,7 +312,7 @@ function buildMinimalTar(files) {
   return Buffer.concat(blocks);
 }
 
-function buildTarHeader(name, size) {
+function buildTarHeader(name, size, { typeFlag = '0', linkname = '' } = {}) {
   const header = Buffer.alloc(512);
   header.write(name, 0, 100, 'utf8');
   header.write('0000644\0', 100, 8, 'utf8'); // mode
@@ -260,7 +321,8 @@ function buildTarHeader(name, size) {
   header.write(size.toString(8).padStart(11, '0') + '\0', 124, 12, 'utf8'); // size (octal)
   header.write('00000000000\0', 136, 12, 'utf8'); // mtime
   header.write('        ', 148, 8, 'utf8'); // checksum placeholder (spaces)
-  header.write('0', 156, 1, 'utf8'); // typeflag: regular file
+  header.write(typeFlag, 156, 1, 'utf8'); // typeflag: '0' regular file, '2' symlink, ...
+  if (linkname) header.write(linkname, 157, 100, 'utf8'); // linkname (symlink/hardlink target)
   header.write('ustar\0', 257, 6, 'utf8'); // magic
   header.write('00', 263, 2, 'utf8'); // version
 
