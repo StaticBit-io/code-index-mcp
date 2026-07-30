@@ -42,6 +42,43 @@ namespace CodeIndex.Core.Tests.Architecture;
 /// a plain <see cref="IndexStore"/> pointed at that slot's directory — reusing the already-exempt
 /// type instead of adding a third one.
 /// </description></item>
+/// <item><description>
+/// Any top-level (non-nested) type whose own metadata carries
+/// <see cref="System.Runtime.CompilerServices.CompilerGeneratedAttribute"/> — a rule for
+/// injected/synthesized types rather than a rule about one specific tool. It exists because
+/// <c>dotnet test --collect:"XPlat Code Coverage"</c> makes coverlet rewrite the built assembly
+/// in place before this test ever sees it: it weaves in a static tracker type (observed, at time
+/// of writing, as <c>Coverlet.Core.Instrumentation.Tracker</c>-namespaced, name
+/// <c>&lt;ModuleName&gt;_&lt;guid&gt;</c>) whose <c>WriteHits</c>/<c>UnloadModule</c> methods do
+/// exactly the raw <c>File</c>/<c>Directory</c>/<c>FileStream</c> access this test exists to
+/// forbid, in order to persist per-line hit counts to a temp file — that is coverlet's job, not a
+/// violation of this codebase's rules. Matching on a hardcoded "Coverlet" namespace was
+/// deliberately rejected: it would silently stop working the moment coverlet renames its
+/// injected namespace (it already has, across major versions), and would need a fresh carve-out
+/// for every other instrumentation tool (dotnet-coverage/Microsoft.CodeCoverage, AltCover,
+/// OpenCover, ...) a future run might use. Verified empirically (dumping the actual instrumented
+/// assembly's metadata) that coverlet's injected type is a top-level, non-nested type stamped
+/// with <c>[CompilerGenerated]</c> — the same attribute Roslyn stamps on its own synthesized
+/// state machines and closures — which makes "carries [CompilerGenerated]" a signal about
+/// *provenance* (compiler- or tool-synthesized, not authored by a person) rather than about any
+/// one tool's naming. <b>What this deliberately keeps catching:</b> a real violation written by a
+/// person always lives, directly or indirectly, in a type <i>they</i> declared. Even when that
+/// person's code is an <c>async</c> method or a lambda — which the C# compiler really does lower
+/// into its own <c>[CompilerGenerated]</c> type — that lowered type is a <i>nested</i> type of the
+/// class the person wrote, and <see cref="ResolveOuterNamespace"/>/<see cref="ResolveOuterFullName"/>
+/// already attribute nested types to their outermost, non-generated ancestor for exemption
+/// purposes; this new rule only inspects that same outer type's own attributes, so it never
+/// exempts a state machine or closure on the strength of its own generated-ness. <b>What this
+/// would stop catching, plainly stated:</b> nothing reachable through ordinary C#, but it is not
+/// airtight against deliberate evasion — a person could hand-write
+/// <c>[System.Runtime.CompilerServices.CompilerGenerated] class Evil { void M() =&gt; File.Delete(...); }</c>
+/// as a top-level type and this rule would skip it. That is indistinguishable, from IL alone,
+/// from genuine tool output; catching it would require also verifying provenance against the PDB
+/// (e.g. "this type has no sequence points because it was never compiled from a source file"),
+/// which this test does not currently do. Slapping an unrelated compiler-services attribute on a
+/// hand-written type is exactly the kind of conspicuous, deliberate act a code review — the
+/// fallback this test exists to reduce reliance on, not eliminate — remains well-suited to catch.
+/// </description></item>
 /// </list>
 /// Everywhere else — <c>Chunking</c>, <c>Indexing</c>, <c>Search</c>, <c>Embedding</c> — must
 /// reach project sources exclusively through the <see cref="ISourceProvider"/> injected into it.
@@ -87,6 +124,9 @@ public sealed class SourceIsolationTests
         "CodeIndex.Core.Storage.OverlayRegistryStore",
     };
 
+    private const string CompilerGeneratedAttributeNamespace = "System.Runtime.CompilerServices";
+    private const string CompilerGeneratedAttributeName = "CompilerGeneratedAttribute";
+
     [Fact]
     public void CoreAssembly_TouchesFileSystemOnlyThroughSourceProviderOrIndexStore()
     {
@@ -125,6 +165,9 @@ public sealed class SourceIsolationTests
                 continue;
 
             if (ExemptFullTypeNames.Contains(outerFullName))
+                continue;
+
+            if (IsOuterTypeCompilerGenerated(reader, typeHandle))
                 continue;
 
             string displayTypeName = BuildDisplayTypeName(reader, typeHandle);
@@ -190,6 +233,58 @@ public sealed class SourceIsolationTests
         }
 
         return typeHandle;
+    }
+
+    /// <summary>
+    /// True if <paramref name="typeHandle"/>'s outermost (non-nested) ancestor is itself directly
+    /// decorated with <see cref="System.Runtime.CompilerServices.CompilerGeneratedAttribute"/> —
+    /// see the third <c>&lt;item&gt;</c> in the class remarks for why this is a sound, tool-agnostic
+    /// exemption and exactly what it does and does not stop the scan from catching. Reusing
+    /// <see cref="ResolveOuterTypeHandle"/> (the same walk <see cref="ResolveOuterNamespace"/> and
+    /// <see cref="ResolveOuterFullName"/> already perform) is what keeps this from ever exempting a
+    /// nested, compiler-generated async state machine or lambda closure on its own generated-ness:
+    /// those are attributed to their non-generated declaring type before this check ever runs.
+    /// </summary>
+    private static bool IsOuterTypeCompilerGenerated(MetadataReader reader, TypeDefinitionHandle typeHandle)
+    {
+        TypeDefinitionHandle outerHandle = ResolveOuterTypeHandle(reader, typeHandle);
+        TypeDefinition outerType = reader.GetTypeDefinition(outerHandle);
+
+        foreach (CustomAttributeHandle attributeHandle in outerType.GetCustomAttributes())
+        {
+            CustomAttribute attribute = reader.GetCustomAttribute(attributeHandle);
+            if (IsCompilerGeneratedAttributeConstructor(reader, attribute.Constructor))
+                return true;
+        }
+
+        return false;
+    }
+
+    /// <summary>
+    /// True if <paramref name="constructorHandle"/> — a <see cref="CustomAttribute.Constructor"/>
+    /// handle — refers to <see cref="System.Runtime.CompilerServices.CompilerGeneratedAttribute"/>'s
+    /// constructor. Always resolves through the <see cref="MemberReference"/> path in practice: the
+    /// attribute is declared in the BCL, external to this assembly, exactly like the forbidden
+    /// <c>System.IO</c> members <see cref="TryResolveForbiddenTargetType"/> resolves the same way.
+    /// A <see cref="MethodDefinitionHandle"/> would mean this project declared its own type named
+    /// <c>CompilerGeneratedAttribute</c>, which it does not.
+    /// </summary>
+    private static bool IsCompilerGeneratedAttributeConstructor(MetadataReader reader, EntityHandle constructorHandle)
+    {
+        if (constructorHandle.Kind != HandleKind.MemberReference)
+            return false;
+
+        MemberReference memberReference = reader.GetMemberReference((MemberReferenceHandle)constructorHandle);
+
+        if (memberReference.Parent.Kind != HandleKind.TypeReference)
+            return false;
+
+        TypeReference typeReference = reader.GetTypeReference((TypeReferenceHandle)memberReference.Parent);
+        string typeName = reader.GetString(typeReference.Name);
+        string typeNamespace = reader.GetString(typeReference.Namespace);
+
+        return string.Equals(typeNamespace, CompilerGeneratedAttributeNamespace, StringComparison.Ordinal) &&
+               string.Equals(typeName, CompilerGeneratedAttributeName, StringComparison.Ordinal);
     }
 
     /// <summary>Builds a readable "Namespace.Outer+Nested" name for diagnostics, so a violation
