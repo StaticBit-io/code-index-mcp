@@ -185,23 +185,135 @@ endpoint или модель Ollama без правки файла.
 «Поле `warning`» в скилле о том, что означает предупреждение об устаревшем индексе и почему
 результаты всё равно можно использовать.
 
+## Как загружается бинарник сервера
+
+Репозиторий плагина **не** хранит собранный сервер — это ~14 МБ преимущественно бинарного
+артефакта, который не дельта-сжимается в git, так что коммит этого файла на каждый релиз навсегда
+увеличивал бы репозиторий. Вместо этого `bin/server.js` при первом использовании скачивает его из
+[GitHub Release](https://github.com/StaticBit-io/code-index-mcp/releases) и кэширует локально:
+
+1. Лаунчер читает поле `serverVersion` из собственного манифеста плагина (`.claude-plugin/plugin.json`
+   — оно намеренно отделено от `version` самого плагина: релиз плагина, где меняются только скилл
+   или документация, не должен заставлять заново скачивать 14 МБ сервера).
+2. Если `~/.code-index-mcp/server/<version>/` уже содержит проверенную установку — сервер
+   запускается сразу, **без какого-либо обращения к сети**.
+3. Иначе лаунчер скачивает `code-index-server-<version>.tar.gz` из релиза с тегом
+   `server-v<version>`, сверяет его SHA-256 с `bin/server.sha256` (закоммичен в этом репозитории —
+   репозиторий и есть корень доверия, поэтому проверка никогда не зависит от того, что пришло по
+   сети), распаковывает и только после этого запускает. Несовпадение контрольной суммы —
+   безусловный отказ, файл не запускается.
+
+При первой загрузке новой версии в stderr виден прогресс:
+
+```text
+[code-index] Server v0.2.0 not found in local cache — downloading from GitHub Releases (~14 MB, one-time)...
+[code-index] Downloaded 14.1 MB / 14.1 MB (100%)
+[code-index] Verifying checksum...
+[code-index] Checksum OK — extracting...
+[code-index] Server v0.2.0 installed at C:\Users\you\.code-index-mcp\server\0.2.0\
+```
+
+После этого каждый следующий запуск (любой проект, любая сессия) использует закэшированную
+установку без сети — пока `serverVersion` не изменится.
+
+**Локально собираете другую версию сервера?** Укажите `CODEINDEX_SERVER_DIR` на директорию с уже
+опубликованной сборкой `CodeIndex.Server` (например, результат
+`dotnet publish src/CodeIndex.Server -c Release -o some/dir` из копии [репозитория](../../)) — и
+лаунчер запустит именно её, без скачивания и без проверки контрольной суммы. Это отладочная
+лазейка для разработки, не то, что стоит выставлять для обычного использования.
+
+### Если скачивание не удалось
+
+**Сеть недоступна, в кэше ещё ничего нет:**
+```text
+[code-index] Server v0.2.0 is not installed yet, and GitHub could not be reached to download it.
+[code-index] Network error: <underlying error>
+
+[code-index] Check your internet connection and try again. If you are offline, download the release
+[code-index] manually and extract it into the folder below:
+
+  https://github.com/StaticBit-io/code-index-mcp/releases/download/server-v0.2.0/code-index-server-0.2.0.tar.gz
+
+  C:\Users\you\.code-index-mcp\server\0.2.0\
+
+[code-index] Then ask your question again — the launcher will find it there and skip the download.
+```
+
+**Несовпадение контрольной суммы (повреждённая загрузка или скомпрометированный ассет) — сервер
+не запускается ни при каких условиях:**
+```text
+[code-index] Downloaded server v0.2.0 but its checksum does not match — refusing to run it.
+[code-index]   expected: <64-char sha256>
+[code-index]   actual:   <64-char sha256>
+
+[code-index] This usually means a corrupted download or a compromised release asset. The file was
+[code-index] not installed. Try again; if this keeps happening, please report it:
+
+  https://github.com/StaticBit-io/code-index-mcp/issues
+```
+
+**Релиз для этой версии плагина не опубликован:**
+```text
+[code-index] No GitHub release found for server v0.2.0 (tag server-v0.2.0).
+
+[code-index] This plugin build expects a matching server release that is not published — check
+[code-index]   https://github.com/StaticBit-io/code-index-mcp/releases
+[code-index] for available versions, or download it manually once published:
+
+  https://github.com/StaticBit-io/code-index-mcp/releases/download/server-v0.2.0/code-index-server-0.2.0.tar.gz
+```
+
+**Приватный репозиторий, нет доступных учётных данных** (сегодня репозиторий приватный; тот же
+код без изменений сработает и без токена, если репозиторий когда-нибудь станет публичным):
+```text
+[code-index] GitHub returned 401 while requesting the server v0.2.0 release.
+[code-index] This repository is private and needs authentication to download release assets.
+
+[code-index] Provide a token with 'repo' scope one of these ways:
+[code-index]   - set CODEINDEX_GITHUB_TOKEN (or GH_TOKEN / GITHUB_TOKEN) in your environment, or
+[code-index]   - authenticate the GitHub CLI (`gh auth login`) — the launcher borrows its token automatically
+
+[code-index] Or download the asset manually with your browser and extract it into:
+
+  C:\Users\you\.code-index-mcp\server\0.2.0\
+
+  https://github.com/StaticBit-io/code-index-mcp/releases/download/server-v0.2.0/code-index-server-0.2.0.tar.gz
+```
+
+Сами сообщения лаунчер печатает на английском (это вывод инструмента, не документация) — здесь
+они приведены как есть, чтобы вы могли узнать их в консоли.
+
+### Параллельные установки
+
+Если два окна Claude Code запускаются одновременно, каждое скачивает и распаковывает архив в
+собственную уникально названную временную директорию внутри `~/.code-index-mcp/server/`, а затем
+атомарно переименовывает её в финальный, именованный по версии путь. Кто закончил первым — тот и
+победил; второй экземпляр обнаруживает уже готовую установку и просто использует её, вместо того
+чтобы упасть с ошибкой или перезаписать файлы. Процесс, убитый посреди загрузки, оставляет мусор
+только в своей собственной временной директории — никогда по пути, который проверяют другие
+запущенные лаунчеры, — поэтому частично скачанный файл невозможно принять за исправный.
+
 ## Платформы
 
-Собранный `bin/server/` — это **портируемая, зависящая от рантайма** публикация
-`CodeIndex.Server`: во всём дереве зависимостей нет нативного/AOT-кода (чистый managed-код:
-Roslyn, `System.Numerics.Tensors`, никакого SQLite или другого нативного interop), поэтому одна
-и та же сборка запускается через `dotnet CodeIndex.Server.dll` на любой ОС с подходящей средой
-выполнения .NET 10. Это проще, чем матрица бинарников на каждый RID, с одной оговоркой: эта
-сборка собрана на Windows, и небольшое число сателлитных сборок, которые SDK .NET разрешает во
-время публикации, специфичны для машины сборки (в рантайме не используются — сервер только
-логирует в консоль/stderr). Если сборка не заработает на Linux/macOS — пересоберите локально:
-`dotnet publish src/CodeIndex.Server -c Release -o plugins/code-index/bin/server` из копии
-[репозитория](../../).
+Опубликованная сборка — это **портируемая, зависящая от рантайма** публикация `CodeIndex.Server`:
+во всём дереве зависимостей нет нативного/AOT-кода (чистый managed-код: Roslyn,
+`System.Numerics.Tensors`, никакого SQLite или другого нативного interop), поэтому одна и та же
+сборка запускается через `dotnet CodeIndex.Server.dll` на любой ОС с подходящей средой выполнения
+.NET 10. Собирает её CI (`.github/workflows/release-server.yml`) на `ubuntu-latest` с
+`-p:SatelliteResourceLanguages=en`, поэтому она не несёт отпечаток машины сборки, как это было бы
+при сборке на собственной Windows-машине разработчика (в первую очередь — специфичные для локали
+сателлитные сборки Roslyn).
 
 ## Приватность
 
 - Ничего не покидает вашу машину, кроме исходящих HTTP-запросов к вашему собственному Ollama
-  (`localhost:11434` по умолчанию) и дисковых операций в корнях настроенных проектов и в
-  кэше индекса на диске (`%LocalAppData%/code-index-mcp/<Id>` по умолчанию).
+  (`localhost:11434` по умолчанию), дисковых операций в корнях настроенных проектов и в кэше
+  индекса на диске (`%LocalAppData%/code-index-mcp/<Id>` по умолчанию), а также — только при
+  первом запуске конкретной версии плагина, и только пока её сборка сервера ещё не в кэше —
+  исходящих HTTPS-запросов к `api.github.com` (метаданные релиза и, для маленьких ассетов, сама
+  загрузка) и `objects.githubusercontent.com` (pre-signed storage-URL, на который `api.github.com`
+  делает редирект для скачивания самого ассета; см. `downloadAssetBuffer` в `bin/server.js`) для
+  скачивания этой сборки. Код проекта или поисковый запрос в этот запрос никогда не попадают; см.
+  [Как загружается бинарник сервера](#как-загружается-бинарник-сервера).
 - Процесс сервера живёт, пока Claude Code держит открытым stdio-канал — завершается вместе с
   клиентом.

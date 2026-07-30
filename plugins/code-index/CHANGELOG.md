@@ -2,6 +2,31 @@
 
 All notable changes to this plugin are listed here. Newest at the top.
 
+## v0.2.0 — 2026-07-29
+
+### Changed
+- **the published server is no longer committed to the repository.** `bin/server/` held a 14 MB,
+  43-file publish output that doesn't delta-compress in git — every future rebuild permanently grew
+  the repository, and it already outweighed the entire commit history. `bin/server.js` now fetches
+  `code-index-server-<version>.tar.gz` from a GitHub Release on first use, verifies it against
+  `bin/server.sha256` (committed in this repository — the repo remains the trust anchor even though
+  the binary itself no longer is), extracts it into `~/.code-index-mcp/server/<version>/`, and runs
+  from there. Every subsequent launch of the same version reuses the cache with no network access at
+  all. See README's "How the server binary is fetched" for the full flow, the exact message for each
+  failure path (offline with an empty cache, checksum mismatch, missing release, private-repo auth),
+  and how concurrent installs (two Claude Code windows starting at once) are handled without a
+  partially-downloaded file ever being mistaken for a good one.
+- the server release is now built by CI on `ubuntu-latest`
+  (`.github/workflows/release-server.yml`) with `-p:SatelliteResourceLanguages=en`, rather than
+  published from a maintainer's Windows machine — the previous committed build carried a small
+  number of Windows-machine-specific Roslyn satellite assemblies that a portable build shouldn't.
+- added a `serverVersion` field to the plugin manifest, deliberately separate from the plugin's own
+  `version`: it names exactly which server release to fetch, so a docs/skill-only plugin bump
+  doesn't force a redundant 14 MB re-download, and a server-only rebuild doesn't need a marketplace
+  version bump to reach users.
+- added `CODEINDEX_SERVER_DIR` as a development-only override: point it at any published
+  `CodeIndex.Server` build directory to run it directly, skipping the download and checksum check
+  entirely. Not for normal use.
 ## v0.1.3 — 2026-07-29
 
 ### Documentation

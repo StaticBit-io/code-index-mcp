@@ -44,10 +44,12 @@ and how to configure a different set per project.
 
 ## Install as a Claude Code plugin (recommended)
 
-The easiest way to run this server is as a Claude Code plugin — it bundles a prebuilt, portable
-server binary plus a launcher that checks every prerequisite above (`.NET` runtime, Ollama
-reachable, model pulled, at least one project configured) and fails with an actionable message
-instead of a stack trace or a silent hang:
+The easiest way to run this server is as a Claude Code plugin — a launcher that checks every
+prerequisite above (`.NET` runtime, Ollama reachable, model pulled, at least one project
+configured) and fails with an actionable message instead of a stack trace or a silent hang, then
+fetches the matching prebuilt, portable server binary from a GitHub Release on first use (cached
+locally after that — see
+[How the server binary is fetched](plugins/code-index/README.md#how-the-server-binary-is-fetched)):
 
 ```text
 /plugin marketplace add StaticBit-io/code-index-mcp
@@ -72,14 +74,17 @@ exact troubleshooting messages for each missing prerequisite — lives in
 [`plugins/code-index/README.md`](plugins/code-index/README.md)
 ([Русский](plugins/code-index/README.ru.md)).
 
-Building/updating the plugin's own binary from source (needed only if you're contributing to this
-repo, not for normal use): `dotnet publish src/CodeIndex.Server -c Release -o
-plugins/code-index/bin/server`.
+Building a server locally to test the plugin against (needed only if you're contributing to this
+repo, not for normal use): `dotnet publish src/CodeIndex.Server -c Release -o some/dir`, then point
+the plugin at it with `CODEINDEX_SERVER_DIR=some/dir` — see
+[the plugin README](plugins/code-index/README.md#how-the-server-binary-is-fetched). Cutting an
+actual release (tagging `server-v<version>`, publishing the GitHub Release asset the plugin fetches
+automatically) is handled by `.github/workflows/release-server.yml`.
 
 ## Manual setup (build from source)
 
 Use this path if you'd rather run the server directly from a source checkout (development on
-this repo, or a platform the committed plugin binary wasn't built for — see
+this repo, or a platform with no published release asset yet — see
 [Platforms](plugins/code-index/README.md#platforms)) instead of installing the plugin above.
 
 1. **Install Ollama** and make sure it's running:
