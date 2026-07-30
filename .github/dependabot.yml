@@ -11,8 +11,26 @@ updates:
     directory: "/"
     schedule:
       interval: "weekly"
+    # Group minor + patch updates into a single PR — major upgrades stay solo so they can be
+    # reviewed individually. Central package management means minor/patch bumps of related
+    # packages (e.g. the Microsoft.Extensions.* family) are not independent: one PR raising
+    # Microsoft.Extensions.Hosting past what Directory.Packages.props pins for
+    # Microsoft.Extensions.Options.ConfigurationExtensions produces an NU1605 version conflict
+    # that only resolves once every affected package moves together. Four separate PRs each
+    # bumping one Microsoft.Extensions.* package to 10.0.10 hit exactly this — grouping them
+    # here is what prevents it from recurring.
+    groups:
+      dotnet-minor-patch:
+        update-types:
+          - minor
+          - patch
 
   - package-ecosystem: "github-actions"
     directory: "/"
     schedule:
       interval: "weekly"
+    groups:
+      actions-minor-patch:
+        update-types:
+          - minor
+          - patch
