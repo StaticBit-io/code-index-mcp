@@ -296,8 +296,10 @@ assemblies, in particular).
 - Nothing leaves your machine except outbound HTTP to your own Ollama instance (`localhost:11434`
   by default), disk I/O under the project roots you configured and the on-disk index cache
   (`%LocalAppData%/code-index-mcp/<Id>` by default), and — only the first time a given plugin
-  version runs, and only until its server build is cached — outbound HTTPS to
-  `api.github.com`/`github.com` to fetch that build. No project code or search query is ever part
-  of that request; see [How the server binary is fetched](#how-the-server-binary-is-fetched).
+  version runs, and only until its server build is cached — outbound HTTPS to `api.github.com`
+  (release metadata and, for small assets, the download itself) and `objects.githubusercontent.com`
+  (the pre-signed storage URL `api.github.com` redirects to for the actual asset download; see
+  `downloadAssetBuffer` in `bin/server.js`) to fetch that build. No project code or search query is
+  ever part of that request; see [How the server binary is fetched](#how-the-server-binary-is-fetched).
 - The server process lives only as long as Claude Code keeps the stdio pipe open — terminates
   with the client.
