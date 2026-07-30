@@ -5,7 +5,7 @@
   </PropertyGroup>
   <ItemGroup>
     <!-- MCP -->
-    <PackageVersion Include="ModelContextProtocol" Version="1.4.1" />
+    <PackageVersion Include="ModelContextProtocol" Version="2.0.0" />
     <!-- Hosting / DI / Configuration -->
     <PackageVersion Include="Microsoft.Extensions.Hosting" Version="10.0.10" />
     <PackageVersion Include="Microsoft.Extensions.Logging.Abstractions" Version="10.0.10" />
