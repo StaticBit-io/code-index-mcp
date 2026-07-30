@@ -309,7 +309,161 @@ test('a real CI-shaped archive (this repo\'s own build, packaged the way the wor
   }
 });
 
+test('stripEmptyOptionalOverrides removes only the three declared overrides when set to the empty string', () => {
+  const source = {
+    CODEINDEX_CONFIG_FILE: '',
+    CODEINDEX_Embedding__Endpoint: '',
+    CODEINDEX_Embedding__Model: '',
+    // Not one of the three names .mcp.json declares, and documented to treat "" as meaningful
+    // (Embedding:QueryInstruction — "no prefix") — must survive untouched.
+    CODEINDEX_Embedding__QueryInstruction: '',
+    // Some other CODEINDEX_* variable this function was never asked to look at.
+    CODEINDEX_CodeIndex__Projects__0__Root: '',
+    PATH: '/usr/bin',
+  };
+
+  const result = srv.stripEmptyOptionalOverrides(source);
+
+  assert.equal('CODEINDEX_CONFIG_FILE' in result, false);
+  assert.equal('CODEINDEX_Embedding__Endpoint' in result, false);
+  assert.equal('CODEINDEX_Embedding__Model' in result, false);
+  assert.equal(result.CODEINDEX_Embedding__QueryInstruction, '');
+  assert.equal(result.CODEINDEX_CodeIndex__Projects__0__Root, '');
+  assert.equal(result.PATH, '/usr/bin');
+  assert.equal(source.CODEINDEX_CONFIG_FILE, '', 'the input object itself must not be mutated');
+});
+
+test('stripEmptyOptionalOverrides leaves a genuine (non-empty) override untouched', () => {
+  const source = {
+    CODEINDEX_Embedding__Endpoint: 'http://example.internal:9999',
+    CODEINDEX_Embedding__Model: 'nomic-embed-text',
+    CODEINDEX_CONFIG_FILE: 'C:\\custom\\config.json',
+  };
+
+  const result = srv.stripEmptyOptionalOverrides(source);
+
+  assert.equal(result.CODEINDEX_Embedding__Endpoint, 'http://example.internal:9999');
+  assert.equal(result.CODEINDEX_Embedding__Model, 'nomic-embed-text');
+  assert.equal(result.CODEINDEX_CONFIG_FILE, 'C:\\custom\\config.json');
+});
+
+test("OPTIONAL_ENV_OVERRIDES matches exactly the placeholders declared in .mcp.json's env block", () => {
+  // Ties the stripped name list to the actual manifest, so a future .mcp.json edit that adds
+  // another `${VAR}` optional-override placeholder without updating this list fails loudly here
+  // instead of silently reintroducing the same empty-string bug for the new variable.
+  const mcpJson = JSON.parse(fs.readFileSync(path.join(__dirname, '..', '.mcp.json'), 'utf8'));
+  const declared = Object.keys(mcpJson.mcpServers['code-index'].env);
+
+  assert.deepEqual([...srv.OPTIONAL_ENV_OVERRIDES].sort(), declared.sort());
+});
+
+test('buildChildEnv: empty launcher-level overrides fall back to the config-file-derived value, never to ""', (t) => {
+  const dir = mkTempDir(t, 'code-index-buildenv-fallback-');
+  const binDir = path.join(dir, 'bin');
+  fs.mkdirSync(binDir, { recursive: true });
+  fs.mkdirSync(path.join(dir, '.claude-plugin'), { recursive: true });
+  fs.writeFileSync(path.join(dir, '.claude-plugin', 'plugin.json'), JSON.stringify({ serverVersion: '9.9.9' }));
+
+  const configPath = path.join(dir, 'config.json');
+  fs.writeFileSync(configPath, JSON.stringify({ Embedding: { Endpoint: 'http://from-config-file:11434' } }));
+
+  withTempEnv(t, {
+    CODEINDEX_CONFIG_FILE: configPath,
+    // Exactly the shape Claude Code produces for two never-customized `${VAR}` placeholders.
+    CODEINDEX_Embedding__Endpoint: '',
+    CODEINDEX_Embedding__Model: '',
+  });
+
+  const isolated = requireIsolatedServerJs(t, binDir);
+  const env = isolated.buildChildEnv();
+
+  assert.equal(
+    env.CODEINDEX_Embedding__Endpoint,
+    'http://from-config-file:11434',
+    'an empty launcher-level override must not shadow the config-file-derived value',
+  );
+  assert.equal(
+    'CODEINDEX_Embedding__Model' in env,
+    false,
+    'an empty override with no config-file-derived counterpart must be absent entirely, not ""',
+  );
+});
+
+test('buildChildEnv: a genuine (non-empty) override still wins over the config-file-derived value', (t) => {
+  const dir = mkTempDir(t, 'code-index-buildenv-real-override-');
+  const binDir = path.join(dir, 'bin');
+  fs.mkdirSync(binDir, { recursive: true });
+  fs.mkdirSync(path.join(dir, '.claude-plugin'), { recursive: true });
+  fs.writeFileSync(path.join(dir, '.claude-plugin', 'plugin.json'), JSON.stringify({ serverVersion: '9.9.9' }));
+
+  const configPath = path.join(dir, 'config.json');
+  fs.writeFileSync(configPath, JSON.stringify({ Embedding: { Endpoint: 'http://from-config-file:11434' } }));
+
+  withTempEnv(t, {
+    CODEINDEX_CONFIG_FILE: configPath,
+    CODEINDEX_Embedding__Endpoint: 'http://user-set-this-deliberately:4321',
+  });
+
+  const isolated = requireIsolatedServerJs(t, binDir);
+  const env = isolated.buildChildEnv();
+
+  assert.equal(env.CODEINDEX_Embedding__Endpoint, 'http://user-set-this-deliberately:4321');
+});
+
+test('buildChildEnv: CODEINDEX_CONFIG_FILE="" resolves to the default config path, not an empty path', (t) => {
+  const dir = mkTempDir(t, 'code-index-buildenv-defaultconfig-');
+  const binDir = path.join(dir, 'bin');
+  fs.mkdirSync(binDir, { recursive: true });
+  fs.mkdirSync(path.join(dir, '.claude-plugin'), { recursive: true });
+  fs.writeFileSync(path.join(dir, '.claude-plugin', 'plugin.json'), JSON.stringify({ serverVersion: '9.9.9' }));
+
+  withTempEnv(t, { CODEINDEX_CONFIG_FILE: '' });
+
+  const isolated = requireIsolatedServerJs(t, binDir);
+
+  // `"" || DEFAULT_CONFIG_PATH` is truthy-fallback in plain JS, so this already resolved
+  // correctly before the launcher fix too — pinned down here as a regression guard, and to
+  // document that CODEINDEX_CONFIG_FILE="" is not a second, separate failure the way the
+  // Embedding:Endpoint/Model shape is.
+  assert.equal(isolated.CONFIG_PATH, path.join(os.homedir(), '.code-index-mcp', 'config.json'));
+  // Must not throw despite there being no real config.json at that default path.
+  assert.doesNotThrow(() => isolated.buildChildEnv());
+});
+
 // ── helpers ───────────────────────────────────────────────────────────────
+
+/** Sets each key in `vars` on `process.env` for the duration of test `t`, restoring the prior
+ * value (or deleting the key if it was unset) via `t.after`. `CONFIG_PATH`/`buildChildEnv` in the
+ * module under test read `process.env` directly (there is no dependency-injection seam for it
+ * here), so tests that need a specific `CODEINDEX_*` shape mutate the real global and must clean
+ * up afterwards rather than leaking state into unrelated tests in this same process. */
+function withTempEnv(t, vars) {
+  const originals = {};
+  for (const key of Object.keys(vars)) {
+    originals[key] = process.env[key];
+    process.env[key] = vars[key];
+  }
+  t.after(() => {
+    for (const key of Object.keys(vars)) {
+      if (originals[key] === undefined) delete process.env[key];
+      else process.env[key] = originals[key];
+    }
+  });
+}
+
+/** Copies server.js into `binDir` (alongside the throwaway `.claude-plugin/plugin.json` the
+ * caller already created) and requires that copy fresh — the same technique the
+ * readExpectedChecksum tests above use. Needed anywhere a test wants to observe module-load-time
+ * state (`CONFIG_PATH`, computed once from `process.env.CODEINDEX_CONFIG_FILE` at require time)
+ * under environment variables the test itself controls, rather than whatever was set when this
+ * test file's own top-level `require('./server.js')` first ran. */
+function requireIsolatedServerJs(t, binDir) {
+  const serverJsCopy = path.join(binDir, 'server.js');
+  fs.copyFileSync(path.join(__dirname, 'server.js'), serverJsCopy);
+  delete require.cache[require.resolve(serverJsCopy)];
+  t.after(() => delete require.cache[require.resolve(serverJsCopy)]);
+  return require(serverJsCopy);
+}
 
 /** Builds a minimal valid ustar archive (regular files only, short names) —
  * just enough structure to exercise parseTarBuffer without shelling out to

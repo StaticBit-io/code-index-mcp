@@ -151,18 +151,58 @@ function flattenEmbedding(config, envOut) {
   }
 }
 
+/** The exact optional overrides `.mcp.json`'s `env` block declares via `${VAR}` placeholders.
+ * Claude Code substitutes an unset placeholder with an *empty string* rather than omitting the
+ * key, so every user who never customized one of these three arrives here with e.g.
+ * `CODEINDEX_Embedding__Endpoint=""` — a value that is never meaningful for any of them (a URI, a
+ * model name, and a file path can none of them usefully be `""`), but which both this launcher's
+ * own "env wins over config file" merge below and .NET's environment-variable configuration
+ * provider treat as an explicit, deliberately-set override — the former skips the config-file
+ * value entirely (see buildChildEnv), the latter clobbers EmbeddingOptions' compiled-in default
+ * and feeds `new Uri("")` (see CodeIndex.Core.Embedding.EmbeddingOptions.Validate for the
+ * server-side half of this fix).
+ *
+ * Only these three declared names are stripped — not every empty `CODEINDEX_*` variable — because
+ * at least one other setting in this same namespace treats an empty string as meaningful, load-
+ * bearing configuration rather than "unset": `Embedding:QueryInstruction` is documented to mean
+ * "send the bare query with no prefix" when empty. A blanket rule would silently reset that back
+ * to its non-empty default for a user who set it that way on purpose. Stripping by exact name is
+ * narrow and predictable: it fixes exactly the shape this launcher's own `.mcp.json` can produce,
+ * and nothing a user sets directly and deliberately. */
+const OPTIONAL_ENV_OVERRIDES = [
+  'CODEINDEX_CONFIG_FILE',
+  'CODEINDEX_Embedding__Endpoint',
+  'CODEINDEX_Embedding__Model',
+];
+
+/** Returns a shallow copy of `sourceEnv` with any of OPTIONAL_ENV_OVERRIDES removed when their
+ * value is exactly `''` — the shape Claude Code produces for an unset `${VAR}` placeholder. A real
+ * override (any non-empty string) passes through untouched, and every other environment variable
+ * (including other CODEINDEX_* ones) is never inspected at all. */
+function stripEmptyOptionalOverrides(sourceEnv) {
+  const result = { ...sourceEnv };
+  for (const key of OPTIONAL_ENV_OVERRIDES) {
+    if (result[key] === '') delete result[key];
+  }
+  return result;
+}
+
 /** Builds the environment the child process runs with: explicit CODEINDEX_
  * variables already present in this process's environment win, per key, over
  * anything derived from the config file — the file exists to make
  * multi-project setup convenient, not to shadow a value a user (or CI, or
- * the .mcp.json env block) deliberately set. */
+ * the .mcp.json env block) deliberately set. An empty-string override from
+ * `.mcp.json`'s own env block (see OPTIONAL_ENV_OVERRIDES/stripEmptyOptionalOverrides above) is
+ * stripped first, so it behaves as genuinely unset — falling through to the config-file-derived
+ * value when there is one, or to the server's own compiled-in default when there isn't — instead
+ * of shadowing either with `""`. */
 function buildChildEnv() {
   const derived = {};
   const fileConfig = readJsonSafe(CONFIG_PATH);
   flattenProjects(fileConfig, derived);
   flattenEmbedding(fileConfig, derived);
 
-  const env = { ...process.env };
+  const env = stripEmptyOptionalOverrides(process.env);
   for (const [key, value] of Object.entries(derived)) {
     if (env[key] === undefined) env[key] = value;
   }
@@ -993,4 +1033,8 @@ module.exports = {
   PLUGIN_MANIFEST_PATH,
   RELEASE_OWNER,
   RELEASE_REPO,
+  OPTIONAL_ENV_OVERRIDES,
+  stripEmptyOptionalOverrides,
+  buildChildEnv,
+  CONFIG_PATH,
 };

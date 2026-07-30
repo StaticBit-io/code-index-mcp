@@ -125,4 +125,52 @@ public sealed class EmbeddingOptions
     /// </para>
     /// </remarks>
     public double MinCosineSimilarity { get; set; } = DefaultMinCosineSimilarity;
+
+    /// <summary>
+    /// Throws if this instance cannot be used safely: <see cref="Endpoint"/> must be a non-empty,
+    /// well-formed absolute URI, and <see cref="Model"/> must be non-empty. Called eagerly from
+    /// <c>Program.cs</c>'s <c>HttpClient</c> configuration (before <c>host.RunAsync()</c> ever
+    /// starts serving), because <see cref="Endpoint"/> otherwise flows straight into <c>new
+    /// Uri(Endpoint)</c>, whose "Invalid URI: The URI is empty." does not name which setting is at
+    /// fault.
+    /// </summary>
+    /// <remarks>
+    /// The failure this guards against is not a hypothetical: the code-index plugin's
+    /// <c>.mcp.json</c> declares <c>CODEINDEX_Embedding__Endpoint</c> and
+    /// <c>CODEINDEX_Embedding__Model</c> as optional overrides via <c>${VAR}</c> placeholders, and
+    /// an MCP client that substitutes an unset placeholder with an empty string (rather than
+    /// omitting the key) makes every user who never customized either setting arrive here with
+    /// <c>Embedding:Endpoint=""</c> — a value <c>Microsoft.Extensions.Configuration</c>'s
+    /// environment-variable provider treats as an explicit override, clobbering the compiled-in
+    /// default above. The plugin's launcher (<c>bin/server.js</c>) now strips exactly that shape
+    /// before spawning this process; this validation is the second, independent line of defense
+    /// for anyone who runs <c>CodeIndex.Server</c> directly with the same empty-string shape.
+    /// </remarks>
+    public void Validate()
+    {
+        if (string.IsNullOrWhiteSpace(Endpoint))
+        {
+            throw new ArgumentException(
+                $"{SectionName}:Endpoint is empty. Set it to a valid Ollama endpoint " +
+                "(e.g. \"http://localhost:11434\"), or leave CODEINDEX_Embedding__Endpoint unset " +
+                "entirely so the built-in default applies.",
+                nameof(Endpoint));
+        }
+
+        if (!Uri.TryCreate(Endpoint, UriKind.Absolute, out _))
+        {
+            throw new ArgumentException(
+                $"{SectionName}:Endpoint (\"{Endpoint}\") is not a valid absolute URI.",
+                nameof(Endpoint));
+        }
+
+        if (string.IsNullOrWhiteSpace(Model))
+        {
+            throw new ArgumentException(
+                $"{SectionName}:Model is empty. Set it to an Ollama model name " +
+                "(e.g. \"qwen3-embedding:4b\"), or leave CODEINDEX_Embedding__Model unset entirely " +
+                "so the built-in default applies.",
+                nameof(Model));
+        }
+    }
 }

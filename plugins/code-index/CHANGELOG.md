@@ -2,6 +2,43 @@
 
 All notable changes to this plugin are listed here. Newest at the top.
 
+## v0.2.1 — 2026-07-30
+
+### Fixes
+- **the plugin failed to start for every user who never manually set one of its three optional
+  environment overrides — in practice, everyone.** `.mcp.json` declares
+  `CODEINDEX_CONFIG_FILE`, `CODEINDEX_Embedding__Endpoint`, and `CODEINDEX_Embedding__Model` via
+  `${VAR}` placeholders. When a placeholder's variable is not set in the host environment, Claude
+  Code substitutes an empty string instead of omitting the key, so the server always received
+  `CODEINDEX_Embedding__Endpoint=""`. .NET configuration binds that as an explicit override,
+  clobbering `EmbeddingOptions.Endpoint`'s compiled-in default of `http://localhost:11434`, which
+  then reached `new Uri("")` and crashed with an unhelpful `Invalid URI: The URI is empty.` before
+  the server ever served a tool. `bin/server.js` now strips exactly these three variables from the
+  child environment when (and only when) their value is the empty string, so an unset override
+  behaves as unset — falling through to a `~/.code-index-mcp/config.json`-derived value when there
+  is one, or to the server's own default otherwise — instead of shadowing either with `""`. A
+  genuine override (any non-empty value, for any of the three) is untouched. `CODEINDEX_Embedding__QueryInstruction`
+  and every other setting are deliberately left alone: only the exact three names `.mcp.json`
+  declares are stripped, not a blanket "every empty `CODEINDEX_*` variable" rule, because
+  `QueryInstruction=""` is documented, load-bearing configuration ("no prefix"), not an
+  accidentally-empty override.
+- `CODEINDEX_CONFIG_FILE=""` was checked separately and is **not** a second failure: the
+  launcher's own `process.env.CODEINDEX_CONFIG_FILE || DEFAULT_CONFIG_PATH` already falls back to
+  the default config path for an empty string (plain JS `||` treats `""` as falsy), so this one was
+  already resolving correctly. It is still covered by the fix above (and by a regression test)
+  purely for consistency — an empty override no longer leaks through to the child process at all,
+  for any of the three variables.
+- added `EmbeddingOptions.Validate()` (`CodeIndex.Core`), called before the embedding `HttpClient`
+  is constructed in `Program.cs`, as a second, independent line of defense: anyone who runs
+  `CodeIndex.Server` directly (bypassing this launcher and its new stripping) with an empty
+  `Embedding:Endpoint` or `Embedding:Model` now gets a message naming the exact setting instead of
+  the same unhelpful URI-parse exception. This is validation with a clear error, not a silent
+  fallback — a genuinely misconfigured endpoint should still stop the server, just with an
+  actionable message. Not accompanied by a `serverVersion` bump: the reported failure is fully
+  fixed at the launcher level for every plugin-installed user, so the already-published
+  `server-v0.2.0` release keeps serving them unchanged; this hardening reaches anyone running the
+  server directly the next time `serverVersion` moves for an unrelated reason.
+
 ## v0.2.0 — 2026-07-29
 
 ### Changed
