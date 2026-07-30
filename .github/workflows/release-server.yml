@@ -79,10 +79,11 @@ jobs:
 
       - name: Package archive
         id: package
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
         run: |
           set -euo pipefail
-          version="${{ steps.version.outputs.version }}"
-          asset="code-index-server-${version}.tar.gz"
+          asset="code-index-server-${VERSION}.tar.gz"
           workspace="$(pwd)"
           # IntelliSense XML docs are meaningless for a runtime deployment —
           # drop them here rather than at compile time (see the note above).
@@ -94,6 +95,28 @@ jobs:
           # needs to handle exactly that shape.
           (cd publish/server && tar czf "${workspace}/${asset}" *)
           sha256sum "${asset}" > "${asset}.sha256"
+
+          # Fail here rather than after publishing a release every install of
+          # the plugin would refuse to run: the manifest's serverVersion must
+          # match the tag we're releasing, and the checksum this build just
+          # produced must match the one committed in bin/server.sha256 (the
+          # launcher's actual trust anchor — see server.js's
+          # readExpectedChecksum/installServerVersion). A mismatch in either
+          # means the launcher would reject this exact release for everyone.
+          manifest_version="$(jq -r '.serverVersion' plugins/code-index/.claude-plugin/plugin.json)"
+          if [ "${manifest_version}" != "${VERSION}" ]; then
+            echo "::error::plugin.json serverVersion (${manifest_version}) does not match tag version (${VERSION})"
+            exit 1
+          fi
+          if ! diff -q "${asset}.sha256" plugins/code-index/bin/server.sha256 >/dev/null; then
+            echo "::error::built asset checksum does not match the committed plugins/code-index/bin/server.sha256"
+            echo "--- built ---"
+            cat "${asset}.sha256"
+            echo "--- committed ---"
+            cat plugins/code-index/bin/server.sha256
+            exit 1
+          fi
+
           echo "asset=${asset}" >> "$GITHUB_OUTPUT"
           echo "--- checksum ---"
           cat "${asset}.sha256"
@@ -101,24 +124,30 @@ jobs:
       - name: Create GitHub Release
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG: ${{ steps.version.outputs.tag }}
+          VERSION: ${{ steps.version.outputs.version }}
+          ASSET: ${{ steps.package.outputs.asset }}
         run: >
-          gh release create "${{ steps.version.outputs.tag }}"
-          "${{ steps.package.outputs.asset }}"
-          "${{ steps.package.outputs.asset }}.sha256"
+          gh release create "$TAG"
+          "$ASSET"
+          "$ASSET.sha256"
           --repo "${{ github.repository }}"
-          --title "code-index server v${{ steps.version.outputs.version }}"
-          --notes "Portable, framework-dependent CodeIndex.Server build for code-index-mcp plugin v${{ steps.version.outputs.version }}. Fetched automatically by plugins/code-index/bin/server.js — see plugins/code-index/bin/server.sha256 in the repository for the checksum this build must match."
+          --title "code-index server v$VERSION"
+          --notes "Portable, framework-dependent CodeIndex.Server build for code-index-mcp plugin v$VERSION. Fetched automatically by plugins/code-index/bin/server.js — see plugins/code-index/bin/server.sha256 in the repository for the checksum this build must match."
 
       - name: Summary
+        env:
+          TAG: ${{ steps.version.outputs.tag }}
+          ASSET: ${{ steps.package.outputs.asset }}
         run: |
           {
-            echo "### Server release — ${{ steps.version.outputs.tag }}"
+            echo "### Server release — ${TAG}"
             echo ""
-            echo "Asset: \`${{ steps.package.outputs.asset }}\`"
+            echo "Asset: \`${ASSET}\`"
             echo ""
             echo '```'
-            cat "${{ steps.package.outputs.asset }}.sha256"
+            cat "${ASSET}.sha256"
             echo '```'
             echo ""
-            echo "Confirm this matches \`plugins/code-index/bin/server.sha256\` on this ref before merging/tagging further."
+            echo "This checksum and the tag version were already verified against plugins/code-index/bin/server.sha256 and plugin.json's serverVersion by the Package archive step — this release would not have been created otherwise."
           } >> "$GITHUB_STEP_SUMMARY"
