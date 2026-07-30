@@ -33,11 +33,15 @@ Thumbs.db
 
 ## The plugin's bin/ ships the launcher script and its release checksum —
 ## source, not build output — so un-ignore those specific files despite the
-## blanket "bin/" rule above. The published server build itself is fetched
-## from a GitHub Release at runtime (see bin/server.js) and must stay
-## ignored: a local `dotnet publish -o .../bin/server` for testing should
-## never be committed again.
+## blanket "bin/" rule above. This is an explicit allow-list, not just an
+## unignore of the two files: `!/plugins/**/bin/` only makes the directory
+## traversable again, so contents are re-ignored by `/plugins/**/bin/*`
+## (covering both loose files and the whole bin/server/ subdirectory, which
+## the published server build — fetched from a GitHub Release at runtime, see
+## bin/server.js — must stay part of; a local `dotnet publish -o .../bin` for
+## testing should never be committed again) before the two specific files
+## needed are un-ignored again.
 !/plugins/**/bin/
+/plugins/**/bin/*
 !/plugins/**/bin/server.js
 !/plugins/**/bin/*.sha256
-/plugins/**/bin/server/
