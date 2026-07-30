@@ -21,7 +21,12 @@ launcher checks all of them before starting the server and tells you exactly wha
 - **.NET 10 runtime** on PATH (`dotnet --list-runtimes` shows a `Microsoft.NETCore.App 10.x`
   line). Install: <https://dotnet.microsoft.com/download/dotnet/10.0>.
 - **Ollama**, running locally (`ollama serve`).
-- The **`qwen3-embedding:4b`** model pulled (`ollama pull qwen3-embedding:4b`, ~2.5 GB, one-time).
+- The **`qwen3-embedding:4b`** model pulled (`ollama pull qwen3-embedding:4b`, ~2.5 GB one-time
+  download, **~10 GB of VRAM** resident while it runs). If that doesn't fit your GPU, `Embedding`
+  is configurable (see [Configuration](#configuration) below) — the
+  [repository README's model comparison](../../README.md#choosing-an-embedding-model-measured)
+  measures four lighter alternatives on the same benchmark, including one (`all-minilm`) that
+  costs under 30 MB of VRAM, so you can pick with numbers instead of guessing.
 - **At least one project configured** — see [Configuration](#configuration) below. There is no
   usable default here: project paths are only known to you.
 

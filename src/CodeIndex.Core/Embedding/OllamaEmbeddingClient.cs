@@ -36,16 +36,19 @@ public sealed class OllamaEmbeddingClient : IEmbeddingClient
     public string Model => _options.Model;
 
     /// <summary>
-    /// Prefixes the query with <see cref="EmbeddingOptions.QueryInstruction"/> (when configured)
-    /// and embeds it via the same <see cref="EmbedAsync"/> path used for passages — the prefix is
-    /// the only thing that distinguishes a query embedding from a passage embedding here, so there
-    /// is nothing else for this method to do differently.
+    /// Prepends <see cref="EmbeddingOptions.QueryInstruction"/> verbatim (when configured) and
+    /// embeds the result via the same <see cref="EmbedAsync"/> path used for passages — the prefix
+    /// is the only thing that distinguishes a query embedding from a passage embedding here, so
+    /// there is nothing else for this method to do differently. <see
+    /// cref="EmbeddingOptions.QueryInstruction"/> is a raw prefix, not a template: this method does
+    /// not add any of its own formatting (no "Instruct:"/"Query:" labels), since different model
+    /// families expect different prefix conventions — see that property's remarks.
     /// </summary>
     public async Task<float[]> EmbedQueryAsync(string query, CancellationToken cancellationToken = default)
     {
         string text = string.IsNullOrEmpty(_options.QueryInstruction)
             ? query
-            : $"Instruct: {_options.QueryInstruction}\nQuery: {query}";
+            : $"{_options.QueryInstruction}{query}";
 
         IReadOnlyList<float[]> embedded = await EmbedAsync([text], cancellationToken).ConfigureAwait(false);
         return embedded[0];

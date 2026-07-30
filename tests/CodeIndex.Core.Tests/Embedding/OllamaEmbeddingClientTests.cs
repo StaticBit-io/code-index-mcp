@@ -222,17 +222,19 @@ public sealed class OllamaEmbeddingClientTests
     }
 
     [Fact]
-    public async Task EmbedQueryAsync_PrefixesQueryWithConfiguredInstruction()
+    public async Task EmbedQueryAsync_PrefixesQueryWithConfiguredInstructionVerbatim()
     {
         // Qwen3-Embedding is trained asymmetrically: passages are encoded plain, but a query is
         // meant to carry an "Instruct: ...\nQuery: ..." prefix naming the retrieval task.
+        // QueryInstruction is a raw prefix, not a template — the caller supplies the full text,
+        // including the "Instruct:"/"\nQuery: " labels, verbatim.
         FakeHttpMessageHandler handler = FakeHttpMessageHandler.Returning("""{"embeddings":[[1,0]]}""");
         HttpClient http = new(handler) { BaseAddress = new Uri("http://localhost:11434") };
         EmbeddingOptions options = new()
         {
             Model = "qwen3-embedding:4b",
             Dimensions = 2,
-            QueryInstruction = "Retrieve the C# member that answers the question.",
+            QueryInstruction = "Instruct: Retrieve the C# member that answers the question.\nQuery: ",
         };
         OllamaEmbeddingClient client = new(http, Options.Create(options));
 
@@ -243,6 +245,29 @@ public sealed class OllamaEmbeddingClientTests
             "Instruct: Retrieve the C# member that answers the question.\\nQuery: how is a payment signed",
             handler.CapturedBodies[0],
             StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public async Task EmbedQueryAsync_SupportsANonQwenRawPrefixLikeNomicsSearchQuery()
+    {
+        // nomic-embed-text uses a plain "search_query: " prefix, not Qwen's "Instruct:/Query:"
+        // format — QueryInstruction must be usable as an arbitrary raw prefix, not just the Qwen
+        // shape, otherwise a different model family can never be configured correctly.
+        FakeHttpMessageHandler handler = FakeHttpMessageHandler.Returning("""{"embeddings":[[1,0]]}""");
+        HttpClient http = new(handler) { BaseAddress = new Uri("http://localhost:11434") };
+        EmbeddingOptions options = new()
+        {
+            Model = "nomic-embed-text",
+            Dimensions = 2,
+            QueryInstruction = "search_query: ",
+        };
+        OllamaEmbeddingClient client = new(http, Options.Create(options));
+
+        await client.EmbedQueryAsync("how is a payment signed", TestContext.Current.CancellationToken);
+
+        Assert.Single(handler.CapturedBodies);
+        Assert.Contains("search_query: how is a payment signed", handler.CapturedBodies[0], StringComparison.Ordinal);
+        Assert.DoesNotContain("Instruct:", handler.CapturedBodies[0], StringComparison.Ordinal);
     }
 
     [Fact]
