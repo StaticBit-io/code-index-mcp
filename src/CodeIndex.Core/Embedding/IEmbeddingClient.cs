@@ -26,8 +26,8 @@ public interface IEmbeddingClient
     /// <remarks>
     /// Deliberately a separate method from <see cref="EmbedAsync"/> rather than an extra parameter
     /// on it: some embedding models (Qwen3-Embedding among them) are trained asymmetrically —
-    /// passages are encoded plain, but a query is meant to carry a short task-instruction prefix
-    /// (see <see cref="EmbeddingOptions.QueryInstruction"/>). Every call site in this codebase
+    /// passages are encoded plain, but a query is meant to carry a short prefix (see <see
+    /// cref="EmbeddingOptions.QueryInstruction"/>). Every call site in this codebase
     /// already embeds queries one at a time and passages in batches, so a dedicated method matches
     /// how the two are actually used, and makes it structurally impossible for passage text to
     /// pick up a query instruction by accident (or vice versa) — there is no shared code path

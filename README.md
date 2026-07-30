@@ -34,7 +34,9 @@ roughly a third to a half of input tokens, plus fewer wasted iterations chasing 
 - The **`qwen3-embedding:4b`** model pulled into Ollama — about **2.5 GB** to download once
   (`ollama pull qwen3-embedding:4b`)
 - **~10 GB of free VRAM** while the model is resident (see [Known limitations](#known-limitations)
-  for what "resident" costs you on a card with less headroom)
+  for what "resident" costs you on a card with less headroom) — on weaker hardware, see
+  [Choosing an embedding model](#choosing-an-embedding-model-measured) below for measured, lighter
+  alternatives instead of guessing
 
 By default, `.cs`, `.razor`, and `.md` files are indexed — see
 [Which files get indexed](#which-files-get-indexed) below for how chunking differs by extension
@@ -113,7 +115,7 @@ this repo, or a platform with no published release asset yet — see
        "Model": "qwen3-embedding:4b",
        "Dimensions": 1024,
        "KeepAlive": "30m",
-       "QueryInstruction": "Given a developer's question about a codebase, retrieve the C# code that implements it.",
+       "QueryInstruction": "Instruct: Given a developer's question about a codebase, retrieve the C# code that implements it.\nQuery: ",
        "MinCosineSimilarity": 0.55
      }
    }
@@ -122,7 +124,9 @@ this repo, or a platform with no published release asset yet — see
    to the query falls below it is excluded outright, never returned just to pad out a short result
    set. `0.55` is this project's measured default for `qwen3-embedding:4b` at 1024 dimensions (see
    [Searching across projects](#searching-across-projects) for the measurement); re-measure before
-   trusting it with a different model, dimensionality, or `QueryInstruction`.
+   trusting it with a different model, dimensionality, or `QueryInstruction` — see
+   [Choosing an embedding model](#choosing-an-embedding-model-measured) below for that measurement
+   already done for four alternatives, including two that need far less VRAM than the default.
    `CodeIndex:Projects` is a list — a single project is just a one-element list, as above. To
    index several repositories from one server, add more entries:
    ```json
@@ -361,6 +365,15 @@ touched, so **changing it does not require a reindex**, unlike `Model` or `Dimen
 change what is actually stored in `vectors.bin`. Set it to `null` or an empty string to send the
 bare query with no prefix.
 
+**`QueryInstruction` is a raw prefix, not a template.** The text is prepended to the query
+verbatim (`$"{QueryInstruction}{query}"`) — the default value above already spells out the full
+`"Instruct: ...\nQuery: "` shape Qwen3-Embedding expects; the code does not add those labels
+itself. This matters the moment a different model family is in play: `nomic-embed-text` expects
+a plain `"search_query: "` prefix with no `Instruct:`/`Query:` labels at all, and a template that
+always inserted those labels could never produce that string for any configured value. See
+[Choosing an embedding model](#choosing-an-embedding-model-measured) below for the correct prefix
+per model.
+
 Measured on the same seven natural-language queries used to validate the design, against
 the same 723-file C# SDK, each result verified by reading the code at the reported location
 rather than trusting a plausible-looking symbol name:
@@ -380,6 +393,92 @@ was a measured decision, not a stylistic one. Two more expensive follow-ups were
 deliberately not applied, because the prefix alone closed the gap: raising `Dimensions` to the
 model's native 2560 (requires a reindex, cache grows to ~92 MB), and switching to
 `qwen3-embedding:8b` (another 2.5 GB download, plus a reindex).
+
+## Choosing an embedding model (measured)
+
+`qwen3-embedding:4b` holds about **10 GB of VRAM** resident (measured via `ollama ps`, not the
+2.5 GB download size — the two are unrelated), which rules it out on a card with less headroom.
+Four alternatives were benchmarked against the same corpus (the project's own 773-file,
+8,988-chunk `xrplcsharp` reference index) with the same method used to pick `0.55` originally
+(see `EmbeddingOptions.MinCosineSimilarity`'s remarks): index a fresh copy of the corpus under its
+own cache, run the same seven queries from
+[Search quality](#search-quality-the-query-instruction-prefix) above, and — separately — record
+top-1 cosine similarity for those and for a set of deliberately irrelevant queries, so the derived
+threshold is honest rather than copied from a different model's distribution.
+
+**The symbol branch never changed across any of the five runs — a hardcoded zero.** None of the
+seven queries below contain a literal identifier substring `SymbolMatcher` can key on (they are
+phrased the way a developer actually asks a question, not the way a class is named), so the
+symbol branch returned **zero hits, for every model, on every one of the seven queries** — the
+task's premise ("the symbol branch does not depend on the model at all") holds, but it also means
+these particular queries have *no* fallback: whatever the vector branch finds is the entire
+answer, and a weak model has nothing to fall back on for exactly this kind of natural-language
+question. A query that already contains the identifier (`TrustSetFlags`, `ComputeSignature`) would
+of course still work via the symbol branch regardless of which embedding model is configured.
+
+| Model | VRAM resident | Download | Dimensions | Index time (773 files) | Cache size | Warm query | 7-query score | Genuine / irrelevant cosine | Derived `MinCosineSimilarity` | `QueryInstruction` |
+|---|---|---|---|---|---|---|---|---|---|---|
+| **qwen3-embedding:4b** (current default) | 10.0 GB | 2.5 GB | 2560 native → 1024 | 416.5 s (~6.9 min) | 37.7 MB | 216 ms | **7/7** (6 rank 1, 1 rank 3 — see above) | 0.616–0.913 / 0.331–0.539 | **0.55** (existing default confirmed, still the right value on the current, slightly larger corpus) | `"Instruct: Given a developer's question about a codebase, retrieve the C# code that implements it.\nQuery: "` |
+| qwen3-embedding:0.6b | **5.8 GB** | 639 MB | 1024 native | 324.4 s (~5.4 min) | 37.7 MB | 294 ms | 3/7 rank 1 (drops→XRP, address parsing, websocket lifecycle) + 2 more at rank 2 (tx hash, trust-line validation) + 1 weak (retry) + 1 miss (payment signing) | 0.573–0.864 / 0.272–0.514 | ~0.53 | same as above (same family, same prefix) |
+| nomic-embed-text | 323 MB | 274 MB | 768 native | 120.5 s (~2.0 min) | 28.9 MB | 39 ms | 2/7 rank 1 (drops→XRP, websocket lifecycle); the other five miss or land on a plausible-looking but wrong DTO/property | 0.654–0.787 / 0.450–0.596 | ~0.61 | `"search_query: "` — **not** `nomic`'s own `"search_document: "` on the passage side; see caveat below |
+| mxbai-embed-large | 618 MB | 669 MB | 1024 native | 172.1 s (~2.9 min) | 37.7 MB | 45 ms | 2/7 rank 1 (drops→XRP, websocket lifecycle); Markdown guides outrank the actual code on 3 of the remaining 5 | 0.636–0.835 / 0.380–**0.720** | **no clean value exists** — see caveat below | `"Represent this sentence for searching relevant passages: "` |
+| all-minilm | **26 MB** | 45 MB | 384 native | 91.9 s (~1.5 min) | **15.8 MB** | 58 ms | 2/7 rank 1 (drops→XRP, address parsing) + 3 more at rank 2–3 (tx hash, trust-line validation, websocket) + 1 weak (retry) + 1 miss (payment signing) | 0.435–0.702 / 0.123–0.262 | ~0.28 | *(none — no asymmetric training)* |
+
+"Genuine / irrelevant cosine" is the same measurement `0.55` was derived from, run per model: top-1
+cosine similarity for 14 genuine developer queries (the seven above plus seven more —
+"AMM pool trading fee", "escrow finish transaction", etc.) vs. 11 deliberately irrelevant ones
+(recipes, hiking, "asdkjfh aslkdjf qwoeiru zxcvnm"). Every hit was verified by opening the file at
+the reported path/line range, not accepted on a plausible-looking symbol name — the same standard
+the original 7/7 measurement used.
+
+**Two caveats, not swept under the table:**
+
+- **`nomic-embed-text` is measured with only half of its intended asymmetry.** It expects
+  `"search_query: "` on the query side and `"search_document: "` on the indexed passage side —
+  this project's architecture only ever has a hook for the query side
+  (`IEmbeddingClient.EmbedQueryAsync`; see [the query instruction prefix](#search-quality-the-query-instruction-prefix)
+  above for why passage text is never touched). The numbers above are a query-side-only
+  approximation of how this model is meant to be used, and likely understate its real quality —
+  this is a limitation of what this project's config surface can express today, not a limitation
+  of the model.
+- **`mxbai-embed-large` has no cosine value that reliably tells genuine from irrelevant.** One of
+  the eleven irrelevant queries — `"asdkjfh aslkdjf qwoeiru zxcvnm"`, deliberate keyboard-mash
+  gibberish — scored **0.720**, higher than the *weakest genuine* query's own 0.636
+  ("where do we validate trustline deletion"). Any single threshold either rejects that genuine
+  query or admits the gibberish one as if it were a real match. Excluding that one outlier as a
+  documented anomaly, the next-highest irrelevant score is 0.506, which would put a workable
+  floor around 0.60 — but that is a judgment call about ignoring an inconvenient data point, not a
+  clean measurement, and anyone configuring this model should know the floor is unreliable against
+  adversarial-looking (or just unlucky) nonsense input.
+
+### Recommendation
+
+- **16 GB+ VRAM to spare, want the best answers:** `qwen3-embedding:4b` (the default) — 7/7 on
+  the reference queries, comfortably the best ranking quality measured here.
+- **Modest GPU (a few GB free, e.g. a laptop sharing VRAM with a display), still want it usable:**
+  `qwen3-embedding:0.6b` is the closest thing to "the default, but lighter" this benchmark found —
+  same family, same prefix, no reindex-format surprises — but budget **5.8 GB**, not the 639 MB
+  download size: Ollama loads it with a 32K-token context window by default, and that context's
+  KV cache, not the model weights, is what actually costs the VRAM. It is a genuinely weaker
+  ranker than the 4b default (3/7 clean vs. 7/7), not merely a smaller download.
+- **CPU-only or a genuinely tiny GPU:** `all-minilm` is the honest floor of what's usable here —
+  26 MB resident, sub-100ms warm queries, a 15.8 MB cache, and it still gets the two clearest
+  queries exactly right at rank 1 with three more one or two ranks off. It should be read as "good
+  enough to triage, not to trust blindly" — half of the seven reference queries land on a
+  plausible-but-wrong chunk at rank 1, which the fused, low-confidence-looking `score` does not by
+  itself distinguish from a real hit.
+- **`nomic-embed-text` and `mxbai-embed-large` were, on this benchmark, not a clear win over
+  `all-minilm` despite costing more VRAM and a larger download.** Both scored 2/7 on the reference
+  queries — the same as the 26 MB model — while resident at 323 MB and 618 MB respectively.
+  `nomic-embed-text`'s measurement is handicapped by the missing passage-side prefix (see caveat
+  above) and may do better with that closed; `mxbai-embed-large`'s unreliable relevance floor is a
+  genuine finding, not a measurement artifact. Neither is recommended over `all-minilm` for this
+  kind of C#-codebase search task based on what was actually measured, though either may still be
+  the right choice in a deployment that already standardized on it for other reasons.
+- **A cheap model turning out nearly as good as the expensive one would have been reported as
+  such — that did not happen here.** The gap between `qwen3-embedding:4b` (7/7) and every
+  alternative (2/7 or 3/7) is large and consistent across the whole model set, not a close call
+  that rounds either way.
 
 ## Cold start and `KeepAlive`
 
