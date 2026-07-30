@@ -53,6 +53,11 @@ public static class Program
         builder.Services.AddHttpClient<IEmbeddingClient, OllamaEmbeddingClient>((serviceProvider, client) =>
         {
             EmbeddingOptions embeddingOptions = serviceProvider.GetRequiredService<IOptions<EmbeddingOptions>>().Value;
+            // Validate() throws a message naming the exact setting (e.g. "Embedding:Endpoint is
+            // empty") instead of letting a blank Endpoint reach `new Uri(...)` below and fail with
+            // the unhelpful "Invalid URI: The URI is empty." — see its own remarks for why an empty
+            // override (as opposed to an absent one) is the realistic failure mode here.
+            embeddingOptions.Validate();
             client.BaseAddress = new Uri(embeddingOptions.Endpoint);
             client.Timeout = EmbeddingClientTimeout;
         });

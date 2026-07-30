@@ -97,6 +97,65 @@ public sealed class ProgramStartupValidationTests
         }
     }
 
+    [Fact]
+    public async Task EmptyEmbeddingEndpoint_FailsBeforeServing_WithMessageNamingTheSetting()
+    {
+        // Exactly the shape Claude Code produces for a never-customized
+        // `${CODEINDEX_Embedding__Endpoint}` placeholder in the code-index plugin's .mcp.json —
+        // an empty string, not an absent key. plugins/code-index/bin/server.js now strips this
+        // before spawning the server (see server.test.js), but this test spawns the server
+        // directly, bypassing the launcher entirely, to confirm the server's own validation
+        // (EmbeddingOptions.Validate) is an independent second line of defense: even without the
+        // launcher fix in front of it, this must fail with a message naming the setting, not the
+        // unhelpful "Invalid URI: The URI is empty." that `new Uri("")` throws on its own.
+        using Process process = StartServer(new Dictionary<string, string?>
+        {
+            ["CODEINDEX_Embedding__Endpoint"] = "",
+        });
+
+        try
+        {
+            (string stderr, string _) = await ReadBothStreamsAsync(process, TestContext.Current.CancellationToken);
+            bool exited = process.WaitForExit(30_000);
+
+            Assert.True(exited, "Server process should fail fast at startup, not hang waiting on stdio.");
+            Assert.NotEqual(0, process.ExitCode);
+            Assert.Contains("Embedding:Endpoint", stderr, StringComparison.Ordinal);
+            Assert.DoesNotContain("URI is empty", stderr, StringComparison.OrdinalIgnoreCase);
+        }
+        finally
+        {
+            if (!process.HasExited)
+                process.Kill(entireProcessTree: true);
+        }
+    }
+
+    [Fact]
+    public async Task EmptyEmbeddingModel_FailsBeforeServing_WithMessageNamingTheSetting()
+    {
+        // Same failure shape as EmptyEmbeddingEndpoint above, for the other optional override
+        // .mcp.json declares (CODEINDEX_Embedding__Model).
+        using Process process = StartServer(new Dictionary<string, string?>
+        {
+            ["CODEINDEX_Embedding__Model"] = "",
+        });
+
+        try
+        {
+            (string stderr, string _) = await ReadBothStreamsAsync(process, TestContext.Current.CancellationToken);
+            bool exited = process.WaitForExit(30_000);
+
+            Assert.True(exited, "Server process should fail fast at startup, not hang waiting on stdio.");
+            Assert.NotEqual(0, process.ExitCode);
+            Assert.Contains("Embedding:Model", stderr, StringComparison.Ordinal);
+        }
+        finally
+        {
+            if (!process.HasExited)
+                process.Kill(entireProcessTree: true);
+        }
+    }
+
     private static Process StartServer(Dictionary<string, string?> environmentOverrides)
     {
         ProcessStartInfo startInfo = new(ServerExecutablePath)
