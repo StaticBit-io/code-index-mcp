@@ -347,6 +347,49 @@ test('stripEmptyOptionalOverrides leaves a genuine (non-empty) override untouche
   assert.equal(result.CODEINDEX_CONFIG_FILE, 'C:\\custom\\config.json');
 });
 
+test('isUnsetOverrideValue recognizes undefined, "", and the literal unexpanded placeholder text', () => {
+  assert.equal(srv.isUnsetOverrideValue(undefined), true);
+  assert.equal(srv.isUnsetOverrideValue(''), true);
+  assert.equal(srv.isUnsetOverrideValue('${CODEINDEX_CONFIG_FILE}'), true);
+  assert.equal(srv.isUnsetOverrideValue('${CODEINDEX_Embedding__Endpoint}'), true);
+  assert.equal(srv.isUnsetOverrideValue('${SOME_VAR}'), true, 'the inner name need not match the outer key');
+  assert.equal(srv.isUnsetOverrideValue('${lower_case_1}'), true);
+
+  // Real values must never be mistaken for the placeholder shape.
+  assert.equal(srv.isUnsetOverrideValue('http://localhost:11434'), false);
+  assert.equal(srv.isUnsetOverrideValue('qwen3-embedding:4b'), false);
+  assert.equal(srv.isUnsetOverrideValue('C:\\custom\\config.json'), false);
+  assert.equal(srv.isUnsetOverrideValue(' '), false, 'whitespace is not the empty string');
+  // A value that merely contains placeholder-looking text is a real (if unusual) value, not unset.
+  assert.equal(srv.isUnsetOverrideValue('prefix-${FOO}-suffix'), false);
+  assert.equal(srv.isUnsetOverrideValue('${FOO} and ${BAR}'), false);
+  assert.equal(srv.isUnsetOverrideValue('${not a valid identifier}'), false);
+  assert.equal(srv.isUnsetOverrideValue('${}'), false);
+});
+
+test('stripEmptyOptionalOverrides removes the three declared overrides when set to the literal unexpanded placeholder text', () => {
+  // This is the exact shape reproduced from Claude Code's own MCP connection logs: when the
+  // backing host variable is unset, the child process receives the eleven-plus-character literal
+  // string `${CODEINDEX_CONFIG_FILE}` rather than an empty string or an absent key.
+  const source = {
+    CODEINDEX_CONFIG_FILE: '${CODEINDEX_CONFIG_FILE}',
+    CODEINDEX_Embedding__Endpoint: '${CODEINDEX_Embedding__Endpoint}',
+    CODEINDEX_Embedding__Model: '${CODEINDEX_Embedding__Model}',
+    // Not one of the three names .mcp.json declares — must survive untouched even though it
+    // looks like the same shape.
+    CODEINDEX_Embedding__QueryInstruction: '${CODEINDEX_Embedding__QueryInstruction}',
+    PATH: '/usr/bin',
+  };
+
+  const result = srv.stripEmptyOptionalOverrides(source);
+
+  assert.equal('CODEINDEX_CONFIG_FILE' in result, false);
+  assert.equal('CODEINDEX_Embedding__Endpoint' in result, false);
+  assert.equal('CODEINDEX_Embedding__Model' in result, false);
+  assert.equal(result.CODEINDEX_Embedding__QueryInstruction, '${CODEINDEX_Embedding__QueryInstruction}');
+  assert.equal(result.PATH, '/usr/bin');
+});
+
 test("OPTIONAL_ENV_OVERRIDES matches exactly the placeholders declared in .mcp.json's env block", () => {
   // Ties the stripped name list to the actual manifest, so a future .mcp.json edit that adds
   // another `${VAR}` optional-override placeholder without updating this list fails loudly here
@@ -428,6 +471,55 @@ test('buildChildEnv: CODEINDEX_CONFIG_FILE="" resolves to the default config pat
   assert.equal(isolated.CONFIG_PATH, path.join(os.homedir(), '.code-index-mcp', 'config.json'));
   // Must not throw despite there being no real config.json at that default path.
   assert.doesNotThrow(() => isolated.buildChildEnv());
+});
+
+test('buildChildEnv: CODEINDEX_CONFIG_FILE="${CODEINDEX_CONFIG_FILE}" resolves to the default config path, not the literal placeholder text', (t) => {
+  // Regression test for the confirmed root cause: unlike the empty-string shape, plain `||`
+  // fallback does NOT catch this one, because the literal placeholder text is itself truthy.
+  // Reproduced from Claude Code's own MCP connection logs — see CHANGELOG — this made CONFIG_PATH
+  // silently become the literal 25-character string `${CODEINDEX_CONFIG_FILE}`, which
+  // readJsonSafe() then failed to find (ENOENT) and treated as "no config" -> "No project is
+  // configured" even for users who had a real config.json at the true default path.
+  const dir = mkTempDir(t, 'code-index-buildenv-placeholderconfig-');
+  const binDir = path.join(dir, 'bin');
+  fs.mkdirSync(binDir, { recursive: true });
+  fs.mkdirSync(path.join(dir, '.claude-plugin'), { recursive: true });
+  fs.writeFileSync(path.join(dir, '.claude-plugin', 'plugin.json'), JSON.stringify({ serverVersion: '9.9.9' }));
+
+  withTempEnv(t, { CODEINDEX_CONFIG_FILE: '${CODEINDEX_CONFIG_FILE}' });
+
+  const isolated = requireIsolatedServerJs(t, binDir);
+
+  assert.equal(isolated.CONFIG_PATH, path.join(os.homedir(), '.code-index-mcp', 'config.json'));
+  assert.doesNotThrow(() => isolated.buildChildEnv());
+  // The child process must never receive the literal placeholder text either.
+  const env = isolated.buildChildEnv();
+  assert.equal('CODEINDEX_CONFIG_FILE' in env, false);
+});
+
+test('buildChildEnv: all three overrides given as literal placeholder text are stripped together, not just CODEINDEX_CONFIG_FILE', (t) => {
+  // End-to-end regression for the exact failure quoted in the bug report, where all three
+  // .mcp.json-declared overrides arrive as their own unexpanded placeholder text simultaneously
+  // (the normal case for a user who never customized any of them).
+  const dir = mkTempDir(t, 'code-index-buildenv-placeholderconfig-e2e-');
+  const binDir = path.join(dir, 'bin');
+  fs.mkdirSync(binDir, { recursive: true });
+  fs.mkdirSync(path.join(dir, '.claude-plugin'), { recursive: true });
+  fs.writeFileSync(path.join(dir, '.claude-plugin', 'plugin.json'), JSON.stringify({ serverVersion: '9.9.9' }));
+
+  withTempEnv(t, {
+    CODEINDEX_CONFIG_FILE: '${CODEINDEX_CONFIG_FILE}',
+    CODEINDEX_Embedding__Endpoint: '${CODEINDEX_Embedding__Endpoint}',
+    CODEINDEX_Embedding__Model: '${CODEINDEX_Embedding__Model}',
+  });
+
+  const isolated = requireIsolatedServerJs(t, binDir);
+
+  assert.equal(isolated.CONFIG_PATH, path.join(os.homedir(), '.code-index-mcp', 'config.json'));
+  const env = isolated.buildChildEnv();
+  assert.equal('CODEINDEX_CONFIG_FILE' in env, false);
+  assert.equal('CODEINDEX_Embedding__Endpoint' in env, false);
+  assert.equal('CODEINDEX_Embedding__Model' in env, false);
 });
 
 // ── helpers ───────────────────────────────────────────────────────────────

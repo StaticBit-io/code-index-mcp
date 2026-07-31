@@ -2,6 +2,43 @@
 
 All notable changes to this plugin are listed here. Newest at the top.
 
+## v0.2.2 — 2026-07-30
+
+### Fixes
+- **the v0.2.1 fix targeted the wrong failure mode — this supersedes it with the actual, confirmed
+  cause.** v0.2.1 assumed Claude Code always substitutes an unset `${VAR}` placeholder with an
+  empty string. Its own MCP connection logs (`~/.claude/.../mcp-logs-plugin-code-index-code-index/`)
+  showed otherwise: with `CODEINDEX_CONFIG_FILE` unset on the host, the launcher received the
+  *literal, unexpanded* 25-character text `${CODEINDEX_CONFIG_FILE}` — not an empty string, not an
+  absent key. Reproduced exactly by spawning `bin/server.js` with the three declared overrides set
+  to their own literal placeholder text. This broke two things the empty-string fix didn't touch:
+  - `CONFIG_PATH` (`bin/server.js`) was computed once at module load as
+    `process.env.CODEINDEX_CONFIG_FILE || DEFAULT_CONFIG_PATH` — correct for the empty-string shape
+    (`"" || x` falls through in JS) but not for the literal-placeholder shape, since a non-empty
+    string is truthy and never falls through. `CONFIG_PATH` silently became the literal placeholder
+    text, `readJsonSafe` then failed to find that (nonexistent) "file" and returned `{}`, and every
+    installed user who never set `CODEINDEX_CONFIG_FILE` saw "No project is configured" — even with
+    a real, valid `~/.code-index-mcp/config.json` sitting at the true default path. This is the
+    server stderr Claude Code actually reported: `Server stderr: [code-index] No project is
+    configured — there is nothing to search yet. ... Create ${CODEINDEX_CONFIG_FILE} with at least
+    one project ... Connection failed after 182ms (-32000): MCP error -32000: Connection closed`.
+  - `stripEmptyOptionalOverrides` (the v0.2.1 fix) only matched the empty string, so
+    `CODEINDEX_Embedding__Endpoint`/`Model` given as their own literal placeholder text passed
+    straight through to the child process and to .NET's configuration binder unmodified, same as
+    before v0.2.1 shipped.
+  - Both are now covered by `isUnsetOverrideValue()`, which treats a value as "unset" when it is
+    absent, the empty string, **or** matches `^\$\{[A-Za-z_][A-Za-z0-9_]*\}$` — the literal `${VAR}`
+    placeholder syntax, matched against the *entire* value so a real value that merely contains the
+    substring `${` (a path, a URL) is never mistaken for it. None of the three settings this
+    launcher declares (a file path, a URI, a model name) could ever legitimately equal that syntax
+    in full, so the check applies unconditionally to all three declared names, same as the
+    empty-string case already did. The empty-string handling from v0.2.1 is unchanged and still
+    correct — this only adds the second shape.
+  - Verified end-to-end: spawning `bin/server.js` with the three overrides set to their literal
+    placeholder text now completes a full MCP `initialize` + `tools/list` handshake against a real
+    `~/.code-index-mcp/config.json`; real (non-placeholder) values and empty-string values were
+    re-verified to still work exactly as in v0.2.1.
+
 ## v0.2.1 — 2026-07-30
 
 ### Fixes
