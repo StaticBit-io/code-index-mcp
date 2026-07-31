@@ -44,6 +44,27 @@ const PLUGIN_ROOT = path.join(__dirname, '..');
 const PLUGIN_MANIFEST_PATH = path.join(PLUGIN_ROOT, '.claude-plugin', 'plugin.json');
 const CHECKSUM_FILE_PATH = path.join(__dirname, 'server.sha256');
 
+/** Matches the literal text Claude Code passes through, verbatim, as the value of a
+ * declared `${VAR}` placeholder in `.mcp.json`'s `env` block when the backing variable is
+ * not set anywhere in the host environment — e.g. the eleven characters
+ * `${CODEINDEX_CONFIG_FILE}`, not an empty string and not an absent key. (An *empty*
+ * string is a separate, already-handled shape — see OPTIONAL_ENV_OVERRIDES below — that
+ * Claude Code produces in other circumstances; this one is a distinct bug with a distinct
+ * fix, confirmed from this launcher's own stderr showing up with the placeholder text
+ * embedded in it: "Create ${CODEINDEX_CONFIG_FILE} with at least one project".) Anchored
+ * to match the *entire* value, not merely contain it, so a legitimate value that happens
+ * to contain the substring `${` somewhere in the middle — a path or URL — is left alone.
+ * None of the settings this launcher declares as optional overrides (a file path, a URL, a
+ * model name) could ever legitimately equal the literal placeholder syntax for a shell
+ * variable in its entirety, so treating a whole-string match as "unset" is safe. */
+const UNSET_PLACEHOLDER_RE = /^\$\{[A-Za-z_][A-Za-z0-9_]*\}$/;
+
+/** True when `value` is the shape Claude Code produces for an unset `${VAR}` placeholder:
+ * absent, the empty string, or the literal unexpanded placeholder text itself. */
+function isUnsetOverrideValue(value) {
+  return value === undefined || value === '' || UNSET_PLACEHOLDER_RE.test(value);
+}
+
 // Where the plugin looks for the user's project list. A JSON file is the
 // natural shape for "a handful of {Id, Root} pairs" — expressing several
 // projects purely through CODEINDEX_CodeIndex__Projects__N__* environment
@@ -51,7 +72,17 @@ const CHECKSUM_FILE_PATH = path.join(__dirname, 'server.sha256');
 // already manages configuration via ENV (CI, a shared machine, etc.) is not
 // forced to also maintain a file.
 const DEFAULT_CONFIG_PATH = path.join(os.homedir(), '.code-index-mcp', 'config.json');
-const CONFIG_PATH = process.env.CODEINDEX_CONFIG_FILE || DEFAULT_CONFIG_PATH;
+// Plain `||` was the launcher's original fallback here, and still handles the empty-string
+// shape correctly (`"" || DEFAULT_CONFIG_PATH` is truthy-fallback in JS) — but it does
+// nothing for the literal-placeholder shape, since `"${CODEINDEX_CONFIG_FILE}"` is itself
+// truthy. That was the confirmed, reproduced cause of every plugin-installed user with an
+// unconfigured `CODEINDEX_CONFIG_FILE` seeing "No project is configured": this constant
+// silently became the literal placeholder text, `readJsonSafe` treated the (nonexistent)
+// path as ENOENT and returned `{}`, and no project ever loaded. isUnsetOverrideValue()
+// covers both shapes.
+const CONFIG_PATH = isUnsetOverrideValue(process.env.CODEINDEX_CONFIG_FILE)
+  ? DEFAULT_CONFIG_PATH
+  : process.env.CODEINDEX_CONFIG_FILE;
 
 const OLLAMA_PROBE_TIMEOUT_MS = 5000;
 
@@ -152,23 +183,27 @@ function flattenEmbedding(config, envOut) {
 }
 
 /** The exact optional overrides `.mcp.json`'s `env` block declares via `${VAR}` placeholders.
- * Claude Code substitutes an unset placeholder with an *empty string* rather than omitting the
- * key, so every user who never customized one of these three arrives here with e.g.
- * `CODEINDEX_Embedding__Endpoint=""` — a value that is never meaningful for any of them (a URI, a
- * model name, and a file path can none of them usefully be `""`), but which both this launcher's
- * own "env wins over config file" merge below and .NET's environment-variable configuration
- * provider treat as an explicit, deliberately-set override — the former skips the config-file
- * value entirely (see buildChildEnv), the latter clobbers EmbeddingOptions' compiled-in default
- * and feeds `new Uri("")` (see CodeIndex.Core.Embedding.EmbeddingOptions.Validate for the
- * server-side half of this fix).
+ * When the backing variable is not set anywhere in the host environment, Claude Code has been
+ * observed producing *two* different shapes for the substituted value instead of omitting the
+ * key — an empty string, and (confirmed from this launcher's own logs, reproduced exactly by
+ * spawning it with these variables set to their literal placeholder text) the unexpanded
+ * placeholder itself, e.g. `CODEINDEX_Embedding__Endpoint="${CODEINDEX_Embedding__Endpoint}"`.
+ * Neither shape is ever meaningful for any of these three (a URI, a model name, and a file path
+ * can none of them usefully be `""` or literal `${...}` text), but both are treated as an
+ * explicit, deliberately-set override by this launcher's own "env wins over config file" merge
+ * below and by .NET's environment-variable configuration provider — the former skips the
+ * config-file value entirely (see buildChildEnv), the latter clobbers EmbeddingOptions'
+ * compiled-in default and feeds `new Uri("${CODEINDEX_Embedding__Endpoint}")` (see
+ * CodeIndex.Core.Embedding.EmbeddingOptions.Validate for the server-side half of the
+ * empty-string fix). isUnsetOverrideValue() (above) recognizes both shapes.
  *
- * Only these three declared names are stripped — not every empty `CODEINDEX_*` variable — because
- * at least one other setting in this same namespace treats an empty string as meaningful, load-
- * bearing configuration rather than "unset": `Embedding:QueryInstruction` is documented to mean
- * "send the bare query with no prefix" when empty. A blanket rule would silently reset that back
- * to its non-empty default for a user who set it that way on purpose. Stripping by exact name is
- * narrow and predictable: it fixes exactly the shape this launcher's own `.mcp.json` can produce,
- * and nothing a user sets directly and deliberately. */
+ * Only these three declared names are stripped — not every such-shaped `CODEINDEX_*` variable —
+ * because at least one other setting in this same namespace treats an empty string as meaningful,
+ * load-bearing configuration rather than "unset": `Embedding:QueryInstruction` is documented to
+ * mean "send the bare query with no prefix" when empty. A blanket rule would silently reset that
+ * back to its non-empty default for a user who set it that way on purpose. Stripping by exact name
+ * is narrow and predictable: it fixes exactly the shapes this launcher's own `.mcp.json` can
+ * produce, and nothing a user sets directly and deliberately. */
 const OPTIONAL_ENV_OVERRIDES = [
   'CODEINDEX_CONFIG_FILE',
   'CODEINDEX_Embedding__Endpoint',
@@ -176,13 +211,14 @@ const OPTIONAL_ENV_OVERRIDES = [
 ];
 
 /** Returns a shallow copy of `sourceEnv` with any of OPTIONAL_ENV_OVERRIDES removed when their
- * value is exactly `''` — the shape Claude Code produces for an unset `${VAR}` placeholder. A real
- * override (any non-empty string) passes through untouched, and every other environment variable
+ * value is the shape Claude Code produces for an unset `${VAR}` placeholder — the empty string, or
+ * the literal, unexpanded placeholder text itself (see isUnsetOverrideValue). A real override (any
+ * other non-empty string) passes through untouched, and every other environment variable
  * (including other CODEINDEX_* ones) is never inspected at all. */
 function stripEmptyOptionalOverrides(sourceEnv) {
   const result = { ...sourceEnv };
   for (const key of OPTIONAL_ENV_OVERRIDES) {
-    if (result[key] === '') delete result[key];
+    if (isUnsetOverrideValue(result[key])) delete result[key];
   }
   return result;
 }
@@ -191,11 +227,12 @@ function stripEmptyOptionalOverrides(sourceEnv) {
  * variables already present in this process's environment win, per key, over
  * anything derived from the config file — the file exists to make
  * multi-project setup convenient, not to shadow a value a user (or CI, or
- * the .mcp.json env block) deliberately set. An empty-string override from
- * `.mcp.json`'s own env block (see OPTIONAL_ENV_OVERRIDES/stripEmptyOptionalOverrides above) is
- * stripped first, so it behaves as genuinely unset — falling through to the config-file-derived
- * value when there is one, or to the server's own compiled-in default when there isn't — instead
- * of shadowing either with `""`. */
+ * the .mcp.json env block) deliberately set. An unset-shaped override from
+ * `.mcp.json`'s own env block — empty string or literal placeholder text (see
+ * OPTIONAL_ENV_OVERRIDES/stripEmptyOptionalOverrides above) — is stripped first, so it behaves as
+ * genuinely unset — falling through to the config-file-derived value when there is one, or to the
+ * server's own compiled-in default when there isn't — instead of shadowing either with a
+ * meaningless value. */
 function buildChildEnv() {
   const derived = {};
   const fileConfig = readJsonSafe(CONFIG_PATH);
@@ -1035,6 +1072,8 @@ module.exports = {
   RELEASE_REPO,
   OPTIONAL_ENV_OVERRIDES,
   stripEmptyOptionalOverrides,
+  isUnsetOverrideValue,
+  UNSET_PLACEHOLDER_RE,
   buildChildEnv,
   CONFIG_PATH,
 };
