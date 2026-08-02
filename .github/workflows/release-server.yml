@@ -94,8 +94,14 @@ jobs:
           (cd publish/second && find . -type f -exec sha256sum {} + | sort -k2) > /tmp/second.txt
           echo "--- files differing between two publishes of the same commit ---"
           diff /tmp/first.txt /tmp/second.txt || true
-          echo "--- entry metadata, first publish ---"
-          (cd publish/server && tar --sort=name --mtime=@0 --owner=0 --group=0 --numeric-owner -cf - * | tar -tvf -)
+          echo "--- digest of the per-file hash listing (stable => contents identical) ---"
+          sha256sum /tmp/first.txt
+          echo "--- raw tar stream, hashed twice in a row ---"
+          (cd publish/server && tar --sort=name --mtime=@0 --owner=0 --group=0 --numeric-owner -cf - * | sha256sum)
+          (cd publish/server && tar --sort=name --mtime=@0 --owner=0 --group=0 --numeric-owner -cf - * | sha256sum)
+          echo "--- gzip version ---"
+          gzip --version | head -1
+          tar --version | head -1
           rm -rf publish/second
 
       - name: Package archive
