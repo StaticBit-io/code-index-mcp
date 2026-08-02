@@ -77,6 +77,22 @@ jobs:
           -p:DebugType=embedded
           --no-restore
 
+      # TEMPORARY diagnostic — remove once the reproducibility cause is known.
+      - name: Diagnose reproducibility
+        run: |
+          set -euo pipefail
+          rm -f publish/server/*.xml
+          sha256sum publish/server/* | sed 's|publish/server/||' | sort -k2 > /tmp/first.txt
+          dotnet publish src/CodeIndex.Server/CodeIndex.Server.csproj -c Release -o publish/second \
+            -p:UseAppHost=false -p:SatelliteResourceLanguages=en -p:DebugType=embedded --no-restore
+          rm -f publish/second/*.xml
+          sha256sum publish/second/* | sed 's|publish/second/||' | sort -k2 > /tmp/second.txt
+          echo "--- files differing between two publishes of the same commit ---"
+          diff /tmp/first.txt /tmp/second.txt || true
+          echo "--- entry metadata, first publish ---"
+          (cd publish/server && tar --sort=name --mtime=@0 --owner=0 --group=0 --numeric-owner -cf - * | tar -tvf -)
+          rm -rf publish/second
+
       - name: Package archive
         id: package
         env:
