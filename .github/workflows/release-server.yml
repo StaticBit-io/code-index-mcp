@@ -140,7 +140,13 @@ jobs:
           #     (already 0 when gzip reads a pipe, set explicitly so it does
           #     not depend on that detail)
           (cd publish/server && tar --sort=name --mtime=@0 --owner=0 --group=0 --numeric-owner -cf - *) \
-            | gzip -n > "${asset}"
+            > "${asset%.gz}"
+          echo "--- tar stream as seen by this step ---"
+          sha256sum "${asset%.gz}"
+          gzip -n -c "${asset%.gz}" > "${asset}"
+          echo "--- gzipped ---"
+          sha256sum "${asset}"
+          rm -f "${asset%.gz}"
           sha256sum "${asset}" > "${asset}.sha256"
 
           # Fail here rather than after publishing a release every install of
