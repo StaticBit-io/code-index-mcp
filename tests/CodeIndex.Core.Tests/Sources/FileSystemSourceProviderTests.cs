@@ -137,6 +137,109 @@ public sealed class FileSystemSourceProviderTests : IDisposable
         Assert.Equal("line2\nline3", text);
     }
 
+    // --- Nested repositories: a directory containing its own ".git" is a separate repo -----
+
+    [Fact]
+    public async Task EnumerateAsync_DirectoryContainingGitFolder_IsSkippedEntirely()
+    {
+        // An ordinary nested clone: ".git" as a directory.
+        string nestedRepo = Path.Combine(_root, "vendor", "some-lib");
+        Directory.CreateDirectory(Path.Combine(nestedRepo, ".git"));
+        Directory.CreateDirectory(nestedRepo);
+        File.WriteAllText(Path.Combine(nestedRepo, "Lib.cs"), "class Lib {}");
+        FileSystemSourceProvider provider = new(_root);
+
+        List<string> found = new();
+        await foreach (string path in provider.EnumerateAsync(TestContext.Current.CancellationToken))
+            found.Add(path);
+
+        Assert.DoesNotContain(found, p => p.Contains("some-lib", StringComparison.Ordinal));
+        Assert.Equal(new[] { "src/A.cs" }, found);
+    }
+
+    [Fact]
+    public async Task EnumerateAsync_DirectoryContainingGitFile_IsSkippedEntirely()
+    {
+        // A worktree checkout: ".git" is a plain file pointing back at the real repo's
+        // ".git/worktrees/<name>", not a directory — the exact shape ".claude/worktrees/..."
+        // takes, and the shape ExcludedSegments' ".git"-by-name entry does not catch, because
+        // the entry here is the worktree directory itself, not something literally named ".git".
+        string nestedRepo = Path.Combine(_root, "vendor", "some-worktree");
+        Directory.CreateDirectory(nestedRepo);
+        File.WriteAllText(Path.Combine(nestedRepo, ".git"), "gitdir: /some/where/.git/worktrees/some-worktree");
+        File.WriteAllText(Path.Combine(nestedRepo, "Lib.cs"), "class Lib {}");
+        FileSystemSourceProvider provider = new(_root);
+
+        List<string> found = new();
+        await foreach (string path in provider.EnumerateAsync(TestContext.Current.CancellationToken))
+            found.Add(path);
+
+        Assert.DoesNotContain(found, p => p.Contains("some-worktree", StringComparison.Ordinal));
+        Assert.Equal(new[] { "src/A.cs" }, found);
+    }
+
+    [Fact]
+    public async Task EnumerateAsync_NormalSubdirectoryWithoutGit_IsNotSkipped()
+    {
+        // A plain subdirectory (no ".git" entry of its own) must still be walked normally —
+        // the nested-repository check must not become an accidental blanket exclusion.
+        string normalSubdirectory = Path.Combine(_root, "src", "Helpers");
+        Directory.CreateDirectory(normalSubdirectory);
+        File.WriteAllText(Path.Combine(normalSubdirectory, "Helper.cs"), "class Helper {}");
+        FileSystemSourceProvider provider = new(_root);
+
+        List<string> found = new();
+        await foreach (string path in provider.EnumerateAsync(TestContext.Current.CancellationToken))
+            found.Add(path);
+
+        Assert.Contains("src/Helpers/Helper.cs", found);
+    }
+
+    [Fact]
+    public async Task EnumerateAsync_NestedRepository_IsSkippedAtAnyDepth()
+    {
+        // The check must apply on every recursion, not just immediate children of the root.
+        string deeplyNestedRepo = Path.Combine(_root, "a", "b", "c", "d", "nested-repo");
+        Directory.CreateDirectory(Path.Combine(deeplyNestedRepo, ".git"));
+        File.WriteAllText(Path.Combine(deeplyNestedRepo, "Deep.cs"), "class Deep {}");
+        // A sibling file at each level along the way confirms the walk itself is not aborted —
+        // only the nested-repo subtree is pruned.
+        Directory.CreateDirectory(Path.Combine(_root, "a", "b"));
+        File.WriteAllText(Path.Combine(_root, "a", "Sibling.cs"), "class Sibling {}");
+        FileSystemSourceProvider provider = new(_root);
+
+        List<string> found = new();
+        await foreach (string path in provider.EnumerateAsync(TestContext.Current.CancellationToken))
+            found.Add(path);
+
+        Assert.DoesNotContain(found, p => p.Contains("Deep.cs", StringComparison.Ordinal));
+        Assert.Contains("a/Sibling.cs", found);
+        Assert.Contains("src/A.cs", found);
+    }
+
+    [Fact]
+    public async Task EnumerateAsync_ClaudeWorktrees_AreExcluded()
+    {
+        // The exact real-world shape that inflated the "wallet" index: nested worktree
+        // checkouts under ".claude/worktrees/<branch>/", each a full copy of the project's own
+        // source. Covered here as its own scenario (not just implied by the generic tests
+        // above) because it is the concrete case that motivated this fix.
+        string worktree = Path.Combine(_root, ".claude", "worktrees", "some-feature-branch");
+        Directory.CreateDirectory(worktree);
+        File.WriteAllText(Path.Combine(worktree, ".git"), "gitdir: /repo/.git/worktrees/some-feature-branch");
+        Directory.CreateDirectory(Path.Combine(worktree, "src"));
+        File.WriteAllText(Path.Combine(worktree, "src", "A.cs"), "line1\nline2\nline3\nline4\n");
+        FileSystemSourceProvider provider = new(_root);
+
+        List<string> found = new();
+        await foreach (string path in provider.EnumerateAsync(TestContext.Current.CancellationToken))
+            found.Add(path);
+
+        // Only the real "src/A.cs" from the root fixture — not the duplicate copy under the
+        // worktree, even though it has the exact same relative name "src/A.cs" one level down.
+        Assert.Equal(new[] { "src/A.cs" }, found);
+    }
+
     // --- Containment: relativePath cannot walk or jump outside _root, symlinks aside -------
 
     [Fact]
