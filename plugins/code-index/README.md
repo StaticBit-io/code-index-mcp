@@ -203,11 +203,11 @@ it locally:
 You'll see progress on stderr the first time a version downloads:
 
 ```text
-[code-index] Server v0.2.0 not found in local cache — downloading from GitHub Releases (~14 MB, one-time)...
+[code-index] Server v0.2.1 not found in local cache — downloading from GitHub Releases (~14 MB, one-time)...
 [code-index] Downloaded 14.1 MB / 14.1 MB (100%)
 [code-index] Verifying checksum...
 [code-index] Checksum OK — extracting...
-[code-index] Server v0.2.0 installed at C:\Users\you\.code-index-mcp\server\0.2.0\
+[code-index] Server v0.2.1 installed at C:\Users\you\.code-index-mcp\server\0.2.1\
 ```
 
 After that, every subsequent launch (any project, any session) reuses the cached install with no
@@ -223,22 +223,22 @@ This is a development escape hatch, not something to set for normal use.
 
 **No network reachable, nothing cached yet:**
 ```text
-[code-index] Server v0.2.0 is not installed yet, and GitHub could not be reached to download it.
+[code-index] Server v0.2.1 is not installed yet, and GitHub could not be reached to download it.
 [code-index] Network error: <underlying error>
 
 [code-index] Check your internet connection and try again. If you are offline, download the release
 [code-index] manually and extract it into the folder below:
 
-  https://github.com/StaticBit-io/code-index-mcp/releases/download/server-v0.2.0/code-index-server-0.2.0.tar.gz
+  https://github.com/StaticBit-io/code-index-mcp/releases/download/server-v0.2.1/code-index-server-0.2.1.tar.gz
 
-  C:\Users\you\.code-index-mcp\server\0.2.0\
+  C:\Users\you\.code-index-mcp\server\0.2.1\
 
 [code-index] Then ask your question again — the launcher will find it there and skip the download.
 ```
 
 **Checksum mismatch (corrupted download or compromised asset) — never run:**
 ```text
-[code-index] Downloaded server v0.2.0 but its checksum does not match — refusing to run it.
+[code-index] Downloaded server v0.2.1 but its checksum does not match — refusing to run it.
 [code-index]   expected: <64-char sha256>
 [code-index]   actual:   <64-char sha256>
 
@@ -250,19 +250,19 @@ This is a development escape hatch, not something to set for normal use.
 
 **Release asset not published for this plugin version:**
 ```text
-[code-index] No GitHub release found for server v0.2.0 (tag server-v0.2.0).
+[code-index] No GitHub release found for server v0.2.1 (tag server-v0.2.1).
 
 [code-index] This plugin build expects a matching server release that is not published — check
 [code-index]   https://github.com/StaticBit-io/code-index-mcp/releases
 [code-index] for available versions, or download it manually once published:
 
-  https://github.com/StaticBit-io/code-index-mcp/releases/download/server-v0.2.0/code-index-server-0.2.0.tar.gz
+  https://github.com/StaticBit-io/code-index-mcp/releases/download/server-v0.2.1/code-index-server-0.2.1.tar.gz
 ```
 
 **Private repository, no credentials available** (this repository is private today; the same code
 path works unchanged, with no token needed, if it ever becomes public):
 ```text
-[code-index] GitHub returned 401 while requesting the server v0.2.0 release.
+[code-index] GitHub returned 401 while requesting the server v0.2.1 release.
 [code-index] This repository is private and needs authentication to download release assets.
 
 [code-index] Provide a token with 'repo' scope one of these ways:
@@ -271,9 +271,9 @@ path works unchanged, with no token needed, if it ever becomes public):
 
 [code-index] Or download the asset manually with your browser and extract it into:
 
-  C:\Users\you\.code-index-mcp\server\0.2.0\
+  C:\Users\you\.code-index-mcp\server\0.2.1\
 
-  https://github.com/StaticBit-io/code-index-mcp/releases/download/server-v0.2.0/code-index-server-0.2.0.tar.gz
+  https://github.com/StaticBit-io/code-index-mcp/releases/download/server-v0.2.1/code-index-server-0.2.1.tar.gz
 ```
 
 ### Concurrent installs

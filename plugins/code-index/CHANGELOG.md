@@ -2,6 +2,40 @@
 
 All notable changes to this plugin are listed here. Newest at the top.
 
+## v0.2.3 — 2026-08-02
+
+Ships server **v0.2.1** (`serverVersion` moves from 0.2.0). The launcher will fetch and verify the
+new release on next start; the old `~/.code-index-mcp/server/0.2.0/` install is simply left alone.
+
+### Fixes
+- **nested repositories are no longer indexed as if they were part of the project.**
+  `FileSystemSourceProvider`'s `ExcludedSegments` list skips a directory literally named `.git`,
+  which stops recursion into that one segment — it did nothing about a subdirectory that is itself
+  the *root* of a separate repository. Such a directory's own `.git` entry was skipped and then
+  every other file inside it was walked and indexed as this project's own source. Found on a real
+  repository with four feature branches checked out as git worktrees under `.claude/worktrees/`,
+  each a full duplicate of the ~900-file source tree: the index read 4,514 files / 34,710 chunks
+  and the cache had grown to 149 MB, against 907 / 6,956 / 30 MB after the fix. Because the
+  duplicates are near-identical copies at different branch states, semantic search returned the
+  same code several times over, each hit carrying a full excerpt.
+  - The rule is structural, not name-based: any directory that directly contains a `.git` entry is
+    treated as a separate repository and skipped outright, at any depth, before recursion. A
+    directory for an ordinary clone, a plain `gitdir: ...` file for a worktree checkout — both are
+    checked. Excluding `.claude` by name would only have fixed the one instance that happened to be
+    found; a worktree under some other tool's directory, or a hand-cloned vendored dependency two
+    levels down, would still have been indexed for exactly the same reason.
+  - Deliberately not configurable. The per-project `Extensions` setting controls what *kind* of
+    in-project content to index, which is a genuine preference; whether a duplicate checkout of
+    another repository counts as "this project's source" is not one. A vendored checkout that
+    genuinely should be searchable can still be given its own project entry pointing at it directly.
+  - **What this still does not catch:** a copied source tree with no `.git` of its own — a zip
+    extract of someone else's repository, or a submodule whose `.git` was stripped. There is no
+    structural signal there; closing that gap needs an explicit ignore mechanism, which is a
+    separate feature.
+  - **Existing indexes keep their duplicate chunks until the affected project is rebuilt.**
+    Incremental refresh drops files that no longer enumerate, so the first refresh after upgrading
+    should clear them on its own; `code_reindex` (or `--build-only`) is the certain path.
+
 ## v0.2.2 — 2026-07-30
 
 ### Fixes
