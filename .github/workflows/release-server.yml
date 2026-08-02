@@ -67,6 +67,26 @@ jobs:
       # off, so IDE0005 can't run" diagnostic into a build failure if
       # overridden at publish time. The XML docs it produces are dropped
       # from the packaged archive in the next step instead.
+      #
+      # EnableSourceControlManagerQueries=false is what makes this build a
+      # function of the source alone. Since .NET 8 the SDK queries git during
+      # build and embeds the resulting commit id in the assembly (as
+      # SourceRevisionId on AssemblyInformationalVersion, and as SourceLink
+      # document mappings inside the PDB, which DebugType=embedded then folds
+      # into the DLL itself). That makes every assembly commit-specific — and
+      # the checksum gate below is a *fixed point* requirement: the checksum
+      # committed in bin/server.sha256 must equal the checksum of the archive
+      # built from the very commit that contains it. With commit id embedded,
+      # writing the checksum changes the commit, which changes the assemblies,
+      # which changes the checksum — the loop provably never converges.
+      # Demonstrated directly: publishing the same source at two commits that
+      # differ only by an empty commit produces different CodeIndex.Server.dll
+      # bytes; with SCM queries off, they are identical.
+      #
+      # The cost is source-stepping into a released build from GitHub, which
+      # nothing in this project's workflow relies on — the server is published
+      # framework-dependent and debugged from a local build, not from the
+      # release asset.
       - name: Publish portable server
         run: >
           dotnet publish src/CodeIndex.Server/CodeIndex.Server.csproj
@@ -75,34 +95,9 @@ jobs:
           -p:UseAppHost=false
           -p:SatelliteResourceLanguages=en
           -p:DebugType=embedded
+          -p:EnableSourceControlManagerQueries=false
+          -p:IncludeSourceRevisionInInformationalVersion=false
           --no-restore
-
-      # TEMPORARY diagnostic — remove once the reproducibility cause is known.
-      - name: Diagnose reproducibility
-        run: |
-          set -euo pipefail
-          rm -f publish/server/*.xml
-          (cd publish/server && find . -type f -exec sha256sum {} + | sort -k2) > /tmp/first.txt
-          # Wipe the intermediate output so this really recompiles, the way a
-          # fresh run does — without it MSBuild sees everything up to date and
-          # just re-copies the first publish's assemblies, which would make any
-          # comparison below vacuous.
-          rm -rf src/CodeIndex.Core/obj src/CodeIndex.Core/bin src/CodeIndex.Server/obj src/CodeIndex.Server/bin
-          dotnet publish src/CodeIndex.Server/CodeIndex.Server.csproj -c Release -o publish/second \
-            -p:UseAppHost=false -p:SatelliteResourceLanguages=en -p:DebugType=embedded
-          rm -f publish/second/*.xml
-          (cd publish/second && find . -type f -exec sha256sum {} + | sort -k2) > /tmp/second.txt
-          echo "--- files differing between two publishes of the same commit ---"
-          diff /tmp/first.txt /tmp/second.txt || true
-          echo "--- digest of the per-file hash listing (stable => contents identical) ---"
-          sha256sum /tmp/first.txt
-          echo "--- raw tar stream, hashed twice in a row ---"
-          (cd publish/server && tar --sort=name --mtime=@0 --owner=0 --group=0 --numeric-owner -cf - * | sha256sum)
-          (cd publish/server && tar --sort=name --mtime=@0 --owner=0 --group=0 --numeric-owner -cf - * | sha256sum)
-          echo "--- gzip version ---"
-          gzip --version | head -1
-          tar --version | head -1
-          rm -rf publish/second
 
       - name: Package archive
         id: package
@@ -126,27 +121,21 @@ jobs:
           # bin/server.sha256 can only be obtained by reading it off a build
           # this workflow already ran, so the *next* run has to produce the
           # identical archive or no release can ever be cut. Plain `tar czf`
-          # does not: the compiled assemblies get a fresh mtime on every
-          # checkout+build, tar records those mtimes per entry, and the
-          # checksum moves even though the assemblies themselves are
-          # byte-identical (the C# compiler's output is already deterministic
-          # — verified by publishing the same commit twice). Measured on
-          # server-v0.2.1: two consecutive runs of the same commit produced
-          # 5978af50… and 4eb7bef3….
+          # does not — the compiled assemblies get a fresh mtime on every
+          # checkout+build and tar records those mtimes per entry, so the
+          # checksum moves even when the archived bytes are identical.
           #   - --sort=name       fixes entry order independent of readdir order
-          #   - --mtime=@0        drops build timestamps, the actual culprit
+          #   - --mtime=@0        drops per-entry build timestamps
           #   - --owner/--group/--numeric-owner  drops the runner's uid/gid
           #   - gzip -n           omits gzip's own mtime/filename header field
           #     (already 0 when gzip reads a pipe, set explicitly so it does
           #     not depend on that detail)
+          # Normalising tar is necessary but was not sufficient on its own: the
+          # assemblies were themselves commit-specific until the publish step
+          # stopped embedding the commit id — see its comment above, which is
+          # the half of this that actually made the gate satisfiable.
           (cd publish/server && tar --sort=name --mtime=@0 --owner=0 --group=0 --numeric-owner -cf - *) \
-            > "${asset%.gz}"
-          echo "--- tar stream as seen by this step ---"
-          sha256sum "${asset%.gz}"
-          gzip -n -c "${asset%.gz}" > "${asset}"
-          echo "--- gzipped ---"
-          sha256sum "${asset}"
-          rm -f "${asset%.gz}"
+            | gzip -n > "${asset}"
           sha256sum "${asset}" > "${asset}.sha256"
 
           # Fail here rather than after publishing a release every install of
