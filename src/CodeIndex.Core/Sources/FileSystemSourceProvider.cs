@@ -10,6 +10,32 @@ namespace CodeIndex.Core.Sources;
 /// whatever agent later reads a search result. The extension filter only constrains the link's
 /// own name, never its target, so the only sound fix is to never dereference a reparse point in
 /// the first place.
+///
+/// <para>
+/// Nested repositories are never indexed either, regardless of what they are named: any directory
+/// that itself contains a ".git" entry (a nested git worktree, a hand-cloned vendored dependency,
+/// a submodule checked out the ordinary way) is a separate repository, not a subdirectory of this
+/// one, and is excluded outright — see <see cref="IsNestedRepositoryRoot"/>. This is a structural
+/// check, not a name-based one, precisely because a name-based exclusion (e.g. hard-coding
+/// ".claude") only ever fixes the one instance that happened to be found; any other nested working
+/// copy — a worktree under a different tool's directory, a manually cloned dependency two levels
+/// down — would still silently get indexed as if it were this project's own source, duplicating
+/// chunks and inflating the index for the same underlying reason. It deliberately has no config
+/// override: unlike <see cref="_extensions"/>, which controls what *kind* of in-project content to
+/// index (a genuine, legitimate preference), whether a duplicate checkout of another repository's
+/// source counts as "this project's source" is not a matter of preference — it never is. A user
+/// who wants a vendored git checkout indexed can still do so by pointing a separate project entry
+/// at that subdirectory directly, making it that project's own root instead of a nested one.
+/// </para>
+///
+/// <para>
+/// What this still misses: a vendored/copied source tree that is not itself a git checkout — no
+/// ".git" directory or file at its root at all, e.g. a zip extract of someone else's repository,
+/// or a submodule whose ".git" was deliberately stripped to save space — has no structural signal
+/// to key on and is indexed as if it were native project source. Closing that gap would need an
+/// explicit ignore list (a ".codeindexignore", conventionally-named vendor directories, etc.),
+/// which is a larger, separate feature, not a fix to this bug.
+/// </para>
 /// </summary>
 public sealed class FileSystemSourceProvider : ISourceProvider
 {
@@ -177,6 +203,21 @@ public sealed class FileSystemSourceProvider : ISourceProvider
                 if (ExcludedSegments.Contains(Path.GetFileName(entry), StringComparer.OrdinalIgnoreCase))
                     continue;
 
+                // A directory that itself contains a ".git" entry (a folder for an ordinary
+                // clone, a file for a worktree checkout — see IsNestedRepositoryRoot) is a
+                // separate repository, not a subdirectory of this one: a nested worktree
+                // (".claude/worktrees/<branch>/"), a hand-cloned vendored dependency, or a git
+                // submodule checked out the normal way. Its files are never part of this
+                // project's own source, so it is skipped outright rather than recursed into —
+                // the same treatment ExcludedSegments gives "bin"/"obj"/etc., but decided by a
+                // structural signal instead of a directory name, so it catches this case at any
+                // depth without needing to know the name in advance. This is deliberately not
+                // configurable (see the type-level remarks): a duplicate checkout of another
+                // repository's source is never legitimately "this project's" source, so there is
+                // no scenario where a user would want it included by relaxing a setting.
+                if (IsNestedRepositoryRoot(entry))
+                    continue;
+
                 foreach (string nested in EnumerateIndexedFiles(entry, depth + 1, cancellationToken))
                     yield return nested;
             }
@@ -218,6 +259,25 @@ public sealed class FileSystemSourceProvider : ISourceProvider
         {
             return null;
         }
+    }
+
+    /// <summary>Whether <paramref name="directory"/> is the root of a separate git repository —
+    /// i.e. it directly contains a ".git" entry. An ordinary clone has ".git" as a directory; a
+    /// git worktree checkout (what <c>.claude/worktrees/&lt;branch&gt;/</c> is) has it as a
+    /// plain file pointing at the real repository's <c>.git/worktrees/&lt;name&gt;</c> instead —
+    /// both are checked, since either one means "this directory is its own repository, not part
+    /// of the one being indexed." <see cref="ExcludedSegments"/> already keeps a ".git" directory
+    /// itself from ever being recursed into; this catches the gap that leaves open, where a
+    /// nested repository's ".git" entry is skipped but everything else inside that nested
+    /// repository is not. <see cref="Directory.Exists"/>/<see cref="File.Exists"/> never throw
+    /// on an inaccessible path (they return <see langword="false"/>), matching the
+    /// fail-open-to-"not excluded" behaviour <see cref="TryGetAttributes"/> uses elsewhere for
+    /// the same reason: a permission error here should not abort the whole enumeration.
+    /// </summary>
+    private static bool IsNestedRepositoryRoot(string directory)
+    {
+        string gitPath = Path.Combine(directory, ".git");
+        return Directory.Exists(gitPath) || File.Exists(gitPath);
     }
 
     private static FileAttributes? TryGetAttributes(string path)
