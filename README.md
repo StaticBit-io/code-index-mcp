@@ -26,8 +26,10 @@ reflect the current state of the tree.
 This only saves *search*. If a task genuinely requires reading eight files in full, they still
 have to be read; output tokens are unaffected. The size of the saving was originally reasoned from
 the mechanism rather than measured — an external reviewer correctly called that out. It has since
-been measured on 20 paired agent runs and the honest number is much smaller than the original
-"a third to a half" guess, and negative in two of the three query categories tested: see
+been measured twice, on two different corpora (20 paired agent runs on a C# SDK, then 12 paired
+runs on a much heavier task set against a Blazor application), and both times the honest number
+was smaller than the original "a third to a half" guess — negative overall in both, and negative
+in most of the categories tested: see
 [Token savings: measured, not estimated](#token-savings-measured-not-estimated) below.
 
 ## Requirements
@@ -416,6 +418,96 @@ shift these numbers in either direction. Treat "semantic search adds token overh
 well-named codebases, and pays off mainly on multi-file questions with no shared vocabulary" as
 the current best-supported claim, not a universal one — and reach for `Grep` first when you already
 have a good guess at the identifier or file name.
+
+### Second measurement: a heavier task set, a different corpus
+
+The first measurement above has a real flaw: each subagent burned 76k–112k tokens total, and most
+of that is the subagent's own startup context, not search. A 7.6% difference is roughly 6k tokens
+against an ~80k baseline — the search phase's actual contribution is mostly drowned out by fixed
+per-agent overhead. That run also used a single, unusually well-named C# SDK, so it says little
+about a typical application codebase.
+
+**Method (what changed from the first measurement).** Same paired-subagent design — identical task
+text to both members of a pair, one restricted to `Grep`/`Glob`/`Read`, the other restricted to
+`code_search`/`code_get_chunk`/`Read`, real per-agent token usage read from each run's own
+completion metadata, every answer independently verified by reading the cited code — but on a
+different corpus (`Wallet.git`, project id `wallet`: a .NET 10 / Blazor XRPL wallet application,
+not a library, so naming is less uniform and the UI layer is Razor components rather than plain
+C#) and with **6 pairs of much heavier tasks** instead of 10 pairs of short ones. Each task requires
+tracing a feature or a setting through 3-6 distinct classes across UI, application-service, and
+storage layers, deliberately designed to take 5-15 tool calls rather than 1-3 — this amortizes the
+fixed subagent-startup cost the first measurement couldn't separate out from actual search cost.
+
+**A corpus problem found during setup, and how it was handled.** `code_index_status` reported 4,514
+files / 34,710 chunks for `wallet` — about 5x more than the repository's actual ~900 source files.
+The cause: the repo contains four full nested git-worktree checkouts under `.claude/worktrees/...`
+(feature branches checked out as worktrees inside the working tree), and
+`FileSystemSourceProvider`'s hard-coded `ExcludedSegments` list (`bin`, `obj`, `.git`,
+`node_modules`, `packages`, `TestResults`) does not exclude nested worktrees, so every duplicated
+copy got indexed too. Re-indexing cleanly was not attempted mid-benchmark; instead, both arms of
+every pair were given the identical instruction to skip any hit under `.claude/worktrees/` and cite
+only canonical paths — verified after the fact by grepping every citation in every answer, none
+pointed into a worktree copy. This keeps the two arms comparable but does not remove the
+contamination's effect on `code_search`'s token cost specifically: a semantic hit list returns a
+full excerpt per result, so five duplicate copies of the same top hit cost roughly five times the
+payload, whereas `Grep`'s one-line-per-match output is cheap to skip past even when duplicated. The
+gap below is probably inflated by this, though — see the per-task tool-call and token-per-call
+numbers — not invented by it; it does not explain results that are simply weird. This exclusion-list
+gap is a real bug worth fixing in this project independently of the benchmark.
+
+| # | Task (shape) | Grep tokens | Grep calls | Grep files | Semantic tokens | Semantic calls | Semantic files | Δ semantic vs. grep | Both correct? |
+|---|---|---:|---:|---:|---:|---:|---:|---:|:---:|
+| W1 | Selected XRPL server/node: model → storage → settings UI → every connection-opening consumer (settings fan-out) | 145,117 | 52 | 21 | 154,879 | 25 | 9 | +6.7% | yes |
+| W2 | FeeEditor UI → applied fee → submission → (absence of) persistence (feature trace) | 141,831 | 27 | 10 | 170,514 | 27 | 6 | +20.2% | yes |
+| W3 | Lost connection → every intermediate hop → `NetworkUnavailableModal` (error surfacing) | 99,861 | 24 | 5 | 138,359 | 15 | 4 | +38.6% | yes |
+| W4 | Auto-Lock timeout: persistence → every reader → the code path that actually locks (settings fan-out) | 94,035 | 15 | 9 | 186,665 | 33 | 8 | +98.5% | yes |
+| W5 | WalletConnect sign request: receipt/parse → UI approval → sign-and-respond (feature trace) | 116,021 | 12 | 6 | 124,741 | 14 | 3 | +7.5% | yes |
+| W6 | Selected fiat display currency: persistence → every display consumer → rate source (settings fan-out) | 140,491 | 56 | 16 | 245,318 | 40 | 6 | +74.6% | yes |
+| | **Total** | **737,356** | **186** | **67** | **1,020,476** | **154** | **36** | **+38.4%** | **12/12** |
+
+**Tokens per tool call** (the number the first measurement couldn't isolate): `Grep`/`Glob`/`Read`
+averaged **3,964 tokens/call** (737,356 / 186); `code_search`/`code_get_chunk`/`Read` averaged
+**6,626 tokens/call** (1,020,476 / 154) — 67% more expensive per call. Semantic search made fewer
+tool calls overall (154 vs. 186, −17%) — the mechanism worked as designed, fewer searches were
+needed to find the same things — but each of its calls cost so much more that the token total lost
+anyway. That is the opposite failure mode from the first measurement, where subagent-startup
+overhead per run diluted a small per-search difference; here, with 5-15 calls per task instead of
+1-3, the fixed overhead is a much smaller share of the total and the search-phase cost is clearly
+visible — and it still favors `Grep`.
+
+**All 12 answers were independently verified**, both by cross-checking that the two members of each
+pair agreed on substance (they did, on every task, down to two answers — W2 and W6 — where *both*
+arms independently discovered that a feature looked wired up in the UI but had no real consumer:
+W2's edited fee is genuinely never persisted anywhere, and W6's fiat-currency setting is saved and
+re-read by its own settings page but never actually consumed to convert a displayed balance,
+`PortfolioItemDto.Price` is hard-coded `null` throughout `PortfolioService`) and by grepping the
+cited files myself for the specific claims (e.g. `SystemService.SetAutoLockAsync`,
+`NetworkUnavailableModal.razor`'s three `state ==` render conditions, `Swap.razor.cs`'s
+`_currentServerService.GetAsync()` call, `ICurrencyService` having exactly one consumer). No
+discrepancies found.
+
+**The honest result, again: semantic search lost, and lost more decisively than on the first
+corpus.** +38.4% overall vs. +7.6% on `XrplCSharp`, and it lost on **every single task this time**
+(0/6, vs. 1/10 clear wins previously). Making the tasks heavier — the change meant to let the
+search phase's real cost show through the subagent-overhead noise — did not help semantic search;
+it made the loss larger. Two independent negative results, on an SDK and on an application, in two
+different UI paradigms (plain C# vs. Razor components), are a real finding about this tool's
+current limits, not a fluke of one corpus: on both codebases tested so far, a competent
+`Grep`/`Glob`/`Read` agent that can form a decent guess at a name or file location is cheaper than
+`code_search`, including on multi-hop tasks spanning several files and layers — the scenario
+semantic search was expected to win. The worktree-contamination caveat above means the *magnitude*
+of this particular 38.4% should be treated with some suspicion (a clean re-index might narrow it),
+but the *direction* — semantic losing on every task — held whether a task's answer touched
+contaminated paths a little (W1, W5) or required checking many candidate consumers (W4, W6), so
+contamination alone does not appear to be the whole story.
+
+**Caveats.** Two corpora, one language (C#) both times, 6-10 tasks per run, subagent-measured
+overhead. The `wallet` index's file/chunk counts were inflated ~5x by unrelated git worktrees at
+measurement time (see above). Neither run reindexed mid-benchmark or tuned `code_search`'s `limit`
+per task, which a real user working interactively would likely do. Until a corpus or task shape
+produces a clean win, the standing advice is: reach for `Grep` first, especially when there's a
+credible name or file-path guess, and treat `code_search` as a tool for when that guess genuinely
+doesn't exist yet.
 
 ## Search quality: the query instruction prefix
 
