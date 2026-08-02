@@ -83,8 +83,13 @@ jobs:
           set -euo pipefail
           rm -f publish/server/*.xml
           (cd publish/server && find . -type f -exec sha256sum {} + | sort -k2) > /tmp/first.txt
+          # Wipe the intermediate output so this really recompiles, the way a
+          # fresh run does — without it MSBuild sees everything up to date and
+          # just re-copies the first publish's assemblies, which would make any
+          # comparison below vacuous.
+          rm -rf src/CodeIndex.Core/obj src/CodeIndex.Core/bin src/CodeIndex.Server/obj src/CodeIndex.Server/bin
           dotnet publish src/CodeIndex.Server/CodeIndex.Server.csproj -c Release -o publish/second \
-            -p:UseAppHost=false -p:SatelliteResourceLanguages=en -p:DebugType=embedded --no-restore
+            -p:UseAppHost=false -p:SatelliteResourceLanguages=en -p:DebugType=embedded
           rm -f publish/second/*.xml
           (cd publish/second && find . -type f -exec sha256sum {} + | sort -k2) > /tmp/second.txt
           echo "--- files differing between two publishes of the same commit ---"
