@@ -67,6 +67,26 @@ jobs:
       # off, so IDE0005 can't run" diagnostic into a build failure if
       # overridden at publish time. The XML docs it produces are dropped
       # from the packaged archive in the next step instead.
+      #
+      # EnableSourceControlManagerQueries=false is what makes this build a
+      # function of the source alone. Since .NET 8 the SDK queries git during
+      # build and embeds the resulting commit id in the assembly (as
+      # SourceRevisionId on AssemblyInformationalVersion, and as SourceLink
+      # document mappings inside the PDB, which DebugType=embedded then folds
+      # into the DLL itself). That makes every assembly commit-specific — and
+      # the checksum gate below is a *fixed point* requirement: the checksum
+      # committed in bin/server.sha256 must equal the checksum of the archive
+      # built from the very commit that contains it. With commit id embedded,
+      # writing the checksum changes the commit, which changes the assemblies,
+      # which changes the checksum — the loop provably never converges.
+      # Demonstrated directly: publishing the same source at two commits that
+      # differ only by an empty commit produces different CodeIndex.Server.dll
+      # bytes; with SCM queries off, they are identical.
+      #
+      # The cost is source-stepping into a released build from GitHub, which
+      # nothing in this project's workflow relies on — the server is published
+      # framework-dependent and debugged from a local build, not from the
+      # release asset.
       - name: Publish portable server
         run: >
           dotnet publish src/CodeIndex.Server/CodeIndex.Server.csproj
@@ -75,6 +95,8 @@ jobs:
           -p:UseAppHost=false
           -p:SatelliteResourceLanguages=en
           -p:DebugType=embedded
+          -p:EnableSourceControlManagerQueries=false
+          -p:IncludeSourceRevisionInInformationalVersion=false
           --no-restore
 
       - name: Package archive
@@ -93,7 +115,27 @@ jobs:
           # (CodeIndex.Server.dll, not ./CodeIndex.Server.dll or a "./"
           # directory entry) — bin/server.js's hand-rolled tar reader only
           # needs to handle exactly that shape.
-          (cd publish/server && tar czf "${workspace}/${asset}" *)
+          #
+          # Every flag below exists to make this archive byte-reproducible,
+          # which the checksum gate immediately after it silently depends on:
+          # bin/server.sha256 can only be obtained by reading it off a build
+          # this workflow already ran, so the *next* run has to produce the
+          # identical archive or no release can ever be cut. Plain `tar czf`
+          # does not — the compiled assemblies get a fresh mtime on every
+          # checkout+build and tar records those mtimes per entry, so the
+          # checksum moves even when the archived bytes are identical.
+          #   - --sort=name       fixes entry order independent of readdir order
+          #   - --mtime=@0        drops per-entry build timestamps
+          #   - --owner/--group/--numeric-owner  drops the runner's uid/gid
+          #   - gzip -n           omits gzip's own mtime/filename header field
+          #     (already 0 when gzip reads a pipe, set explicitly so it does
+          #     not depend on that detail)
+          # Normalising tar is necessary but was not sufficient on its own: the
+          # assemblies were themselves commit-specific until the publish step
+          # stopped embedding the commit id — see its comment above, which is
+          # the half of this that actually made the gate satisfiable.
+          (cd publish/server && tar --sort=name --mtime=@0 --owner=0 --group=0 --numeric-owner -cf - *) \
+            | gzip -n > "${asset}"
           sha256sum "${asset}" > "${asset}.sha256"
 
           # Fail here rather than after publishing a release every install of
