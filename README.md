@@ -24,8 +24,11 @@ contain a string. The index refreshes itself incrementally before every search, 
 reflect the current state of the tree.
 
 This only saves *search*. If a task genuinely requires reading eight files in full, they still
-have to be read; output tokens are unaffected. On search-heavy sessions the expected saving is
-roughly a third to a half of input tokens, plus fewer wasted iterations chasing the wrong file.
+have to be read; output tokens are unaffected. The size of the saving was originally reasoned from
+the mechanism rather than measured — an external reviewer correctly called that out. It has since
+been measured on 20 paired agent runs and the honest number is much smaller than the original
+"a third to a half" guess, and negative in two of the three query categories tested: see
+[Token savings: measured, not estimated](#token-savings-measured-not-estimated) below.
 
 ## Requirements
 
@@ -350,6 +353,69 @@ first get an embedding back from Ollama, which dominates the cost. See
 between the original estimates and what was actually measured.
 
 The cold number is why `Embedding:KeepAlive` exists — see the next section.
+
+## Token savings: measured, not estimated
+
+The original claim in this README — "roughly a third to a half" of input tokens saved on
+search-heavy sessions — was reasoned from the mechanism (fewer wrong files opened, fewer broad
+sweeps) and never actually measured. An external reviewer pointed that out. This section replaces
+it with a real measurement.
+
+**Method.** 10 pairs of subagents (20 agents total, one Claude Code session each) were given the
+*same* task text and pointed at the same indexed C# repository (`XrplCSharp`, 773 files, 8,988
+chunks, this same server). One member of each pair could use only `Grep`/`Glob`/`Read`; the other
+could use only `code_search`/`code_get_chunk` plus `Read`. Both were told to work efficiently and
+stop once confident, then state a final answer (file + line range) and their own tool-call count.
+Each agent's actual token usage was read from its own run, not estimated. Every answer was then
+independently verified by reading the cited code, not by whether the answer sounded plausible.
+Tasks were deliberately split into three categories to test the hypothesis that semantic search
+should win when no exact identifier is given, tie or lose when one is, and either pay for itself
+or not on questions that span several files:
+
+| # | Task (category) | Grep tokens | Semantic tokens | Δ semantic vs. grep | Both correct? |
+|---|---|---:|---:|---:|:---:|
+| A1 | Where is a transaction's fee computed (intent, no identifier) | 86,227 | 85,451 | −0.9% | yes |
+| A2 | How does the client decide a request timed out (intent) | 88,042 | 89,615 | +1.8% | yes |
+| A3 | How does the client auto-reconnect after a dropped socket (intent) | 84,080 | 84,205 | +0.1% | yes |
+| B1 | Where is `TrustSetFlags` defined and used (exact symbol) | 79,770 | 91,314 | +14.5% | yes |
+| B2 | Where is `XrplErrorCategory` defined and used (exact symbol) | 77,338 | 90,330 | +16.8% | yes |
+| B3 | Where is `LedgerEntryType` defined — a trap, two distinct types exist (exact symbol) | 82,974 | 84,385 | +1.7% | yes |
+| B4 | Where is `AccountRootFlags` defined and used (exact symbol) | 76,153 | 98,208 | +29.0% | yes |
+| C1 | How is `AMMDeposit` validated end to end (spans files) | 86,647 | 112,189 | +29.5% | yes |
+| C2 | How is `NFTokenMint` validated end to end (spans files) | 91,320 | 95,408 | +4.5% | yes |
+| C3 | How does multi-sign + combine work end to end (spans files) | 106,522 | 93,264 | −12.4% | yes |
+| | **Total** | **859,073** | **924,369** | **+7.6%** | **20/20** |
+
+**The honest result: semantic search cost more tokens than `Grep`/`Glob`/`Read` overall, in this
+sample — a 7.6% loss, not a third-to-half saving.** Both members reached a correct, independently
+verified answer on all 20 tasks, so the difference is pure token cost, not one side failing and
+retrying. Per category:
+
+- **Intent-only questions (A), no identifier given** — roughly a wash (+0.36% for semantic,
+  i.e. no measurable saving either way). The expectation was that this is where semantic search
+  should win; it didn't, in this codebase.
+- **Exact-symbol lookups (B)** — semantic search lost clearly, using **15.2% more** tokens than
+  `Grep`. This matches expectations: a literal identifier is exactly what `Grep` is built for.
+- **Multi-file concept questions (C)**, where semantic search was expected to pay for itself —
+  it lost here too, using **5.75% more** tokens, driven mostly by task C1 where the semantic
+  agent made more tool calls chasing the same answer `Grep` reached faster.
+
+**Why `Grep` did this well here:** `XrplCSharp` uses consistent, descriptive C# naming
+(`ValidateAMMDeposit`, `ReconnectLoopAsync`, `CalculateFeePerTransactionType`) — a skilled agent
+can often guess a good literal substring on the first try, which is close to the best case for
+plain text search. Task C3 is the one clear semantic win in this sample (−12.4%): the correct
+answer was split across three files with no single obviously-greppable shared term
+(`Signer.Multisign`, `XrplWallet.SignMulti`, `CoSigningEngine.Combine`), which is closer to the
+scenario semantic search is meant for.
+
+**Caveats.** This is one corpus (a single well-named C# SDK), one language, 10 tasks, and
+subagent-measured overhead that differs from a real interactive session (no back-and-forth
+follow-up questions, no context accumulated from earlier turns). A codebase with less consistent
+naming, or a session with many more searches where index warm-up cost amortizes further, could
+shift these numbers in either direction. Treat "semantic search adds token overhead on
+well-named codebases, and pays off mainly on multi-file questions with no shared vocabulary" as
+the current best-supported claim, not a universal one — and reach for `Grep` first when you already
+have a good guess at the identifier or file name.
 
 ## Search quality: the query instruction prefix
 
