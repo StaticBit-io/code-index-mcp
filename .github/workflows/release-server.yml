@@ -93,7 +93,27 @@ jobs:
           # (CodeIndex.Server.dll, not ./CodeIndex.Server.dll or a "./"
           # directory entry) — bin/server.js's hand-rolled tar reader only
           # needs to handle exactly that shape.
-          (cd publish/server && tar czf "${workspace}/${asset}" *)
+          #
+          # Every flag below exists to make this archive byte-reproducible,
+          # which the checksum gate immediately after it silently depends on:
+          # bin/server.sha256 can only be obtained by reading it off a build
+          # this workflow already ran, so the *next* run has to produce the
+          # identical archive or no release can ever be cut. Plain `tar czf`
+          # does not: the compiled assemblies get a fresh mtime on every
+          # checkout+build, tar records those mtimes per entry, and the
+          # checksum moves even though the assemblies themselves are
+          # byte-identical (the C# compiler's output is already deterministic
+          # — verified by publishing the same commit twice). Measured on
+          # server-v0.2.1: two consecutive runs of the same commit produced
+          # 5978af50… and 4eb7bef3….
+          #   - --sort=name       fixes entry order independent of readdir order
+          #   - --mtime=@0        drops build timestamps, the actual culprit
+          #   - --owner/--group/--numeric-owner  drops the runner's uid/gid
+          #   - gzip -n           omits gzip's own mtime/filename header field
+          #     (already 0 when gzip reads a pipe, set explicitly so it does
+          #     not depend on that detail)
+          (cd publish/server && tar --sort=name --mtime=@0 --owner=0 --group=0 --numeric-owner -cf - *) \
+            | gzip -n > "${asset}"
           sha256sum "${asset}" > "${asset}.sha256"
 
           # Fail here rather than after publishing a release every install of
