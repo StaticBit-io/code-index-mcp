@@ -82,11 +82,11 @@ jobs:
         run: |
           set -euo pipefail
           rm -f publish/server/*.xml
-          sha256sum publish/server/* | sed 's|publish/server/||' | sort -k2 > /tmp/first.txt
+          (cd publish/server && find . -type f -exec sha256sum {} + | sort -k2) > /tmp/first.txt
           dotnet publish src/CodeIndex.Server/CodeIndex.Server.csproj -c Release -o publish/second \
             -p:UseAppHost=false -p:SatelliteResourceLanguages=en -p:DebugType=embedded --no-restore
           rm -f publish/second/*.xml
-          sha256sum publish/second/* | sed 's|publish/second/||' | sort -k2 > /tmp/second.txt
+          (cd publish/second && find . -type f -exec sha256sum {} + | sort -k2) > /tmp/second.txt
           echo "--- files differing between two publishes of the same commit ---"
           diff /tmp/first.txt /tmp/second.txt || true
           echo "--- entry metadata, first publish ---"
