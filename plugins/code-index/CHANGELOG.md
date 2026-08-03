@@ -2,6 +2,33 @@
 
 All notable changes to this plugin are listed here. Newest at the top.
 
+## v0.2.4 — 2026-08-03
+
+Ships server **v0.2.2**.
+
+### Changes
+- **`code_search` returns far less per call.** Two A/B measurements found this tool costing *more*
+  tokens than plain `Grep` — most recently +25.7% on a clean index while making 26% *fewer* tool
+  calls. The mechanism was isolated rather than guessed at: `code_search` averaged 9,086 tokens per
+  call against `Grep`'s 5,348. It finds things in fewer searches and then loses on what each search
+  returns.
+  - Excerpts are capped at **5 lines** per hit, down from 15. An excerpt's job is to let a caller
+    judge relevance, not to stand in for the declaration — every hit already carries `signature`
+    and `doc` as separate fields, and `code_get_chunk` exists for the body. Short chunks are
+    unaffected: a one-line property still returns one line, never a padded five.
+  - The default `limit` is **5**, down from 10. Search depth inside each branch before
+    Reciprocal-Rank-Fusion is unchanged (it is bounded below by an independent floor of 50), so
+    this changes how many hits are returned, not how well they are ranked.
+  - Measured on eight representative queries: the default response fell from 11,421 to 5,187
+    characters, **−54.6%**. Roughly a third of that came from the shorter excerpt and the rest from
+    the lower default.
+  - Both tool descriptions now say excerpts are short and that following up with `code_get_chunk`
+    is the expected common case rather than a rare fallback.
+  - No recall or quality test moved. The golden-query suite passes `limit` explicitly (3 or 5), so
+    it never depended on the default.
+- Whether this is enough to make the tool cheaper than `Grep` has **not** been re-measured yet. The
+  published benchmark numbers were taken on the old defaults and should be read as historical.
+
 ## v0.2.3 — 2026-08-02
 
 Ships server **v0.2.1** (`serverVersion` moves from 0.2.0). The launcher will fetch and verify the
