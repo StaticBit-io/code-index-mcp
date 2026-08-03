@@ -199,14 +199,15 @@ find where something is *implemented*, not to find every literal occurrence of a
 | Parameter | Type | Default | Description |
 |---|---|---|---|
 | `query` | string | — | Natural-language question or exact identifier/symbol name. Blank/whitespace-only is rejected with an error rather than returning arbitrary hits. |
-| `limit` | int | `10` | Maximum number of hits to return. Negative is rejected with an error; `0` returns none. Not silently capped — a large limit searches deeper into both branches to try to satisfy it. |
+| `limit` | int | `5` | Maximum number of hits to return. Negative is rejected with an error; `0` returns none. Not silently capped — a large limit searches deeper into both branches to try to satisfy it. |
 | `kind` | string? | `null` | Restrict to one chunk kind: `Class`, `Interface`, `Struct`, `Record`, `Enum`, `Method`, `Constructor`, `Property`, `Field`, or `FileFragment`. Case-insensitive; an unrecognized value is ignored silently. |
 | `path_filter` | string? | `null` | Case-insensitive substring filter on the file's relative path. |
 | `project` | string? | `null` | Restrict the search to one configured project's `Id`. Omit to search every configured project and merge the results. |
 
 Returns a ranked list of hits, each with an `id`, the `project` it came from, file path, line
-range, kind, symbol, signature, doc comment (if any), a short excerpt, an optional
-`excerpt_may_be_stale` flag, and a `score`: the fused Reciprocal-Rank-Fusion value (not a raw
+range, kind, symbol, signature, doc comment (if any), a short excerpt (at most 5 lines from the
+start of the declaration — enough to judge relevance, not a substitute for `code_get_chunk`), an
+optional `excerpt_may_be_stale` flag, and a `score`: the fused Reciprocal-Rank-Fusion value (not a raw
 similarity percentage — see [Searching across projects](#searching-across-projects) for what feeds
 it). Higher is better; a hit near the bottom of only one branch's ranking is a weak match worth a
 second look. The vector branch also applies a relevance floor before fusion — see
@@ -360,6 +361,11 @@ The original claim in this README — "roughly a third to a half" of input token
 search-heavy sessions — was reasoned from the mechanism (fewer wrong files opened, fewer broad
 sweeps) and never actually measured. An external reviewer pointed that out. This section replaces
 it with a real measurement.
+
+**Note:** this measurement predates the `limit`/excerpt-length defaults documented above (it ran
+against `limit=10` and a 15-line excerpt cap, since lowered to `5` and 5 lines respectively — see
+`code_search`'s per-hit payload). A re-run against the current defaults has not been done; treat
+the numbers below as the shape of the trade-off, not as still-current absolute figures.
 
 **Method.** 10 pairs of subagents (20 agents total, one Claude Code session each) were given the
 *same* task text and pointed at the same indexed C# repository (`XrplCSharp`, 773 files, 8,988

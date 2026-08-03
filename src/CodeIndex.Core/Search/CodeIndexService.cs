@@ -76,8 +76,19 @@ public sealed class CodeIndexService
     /// a given call is derived from this floor and the caller's <c>limit</c>.</summary>
     private const int MinBranchDepth = 50;
 
-    /// <summary>Excerpts shown to callers are capped at this many lines.</summary>
-    private const int MaxExcerptLines = 15;
+    /// <summary>
+    /// Excerpts shown to callers are capped at this many lines. Kept small on purpose: an
+    /// excerpt's job is to let a caller judge relevance, not to substitute for the full
+    /// declaration — every hit already carries the chunk's <c>signature</c> field separately
+    /// (see <see cref="Chunking.CodeChunk.Signature"/>), and <see cref="GetChunkAsync"/> exists
+    /// specifically for callers that need the rest of the body. A flat per-hit cap, rather than
+    /// one that scales with the chunk's own length, is deliberate: a longer member does not
+    /// need a longer preview to be judged relevant, and scaling the cap would reintroduce the
+    /// exact per-call cost this constant exists to bound. Short chunks are unaffected either
+    /// way — <see cref="ReadExcerptAsync"/> never reads past the chunk's own <c>EndLine</c>, so
+    /// a one-line property still returns exactly one line, not a padded five.
+    /// </summary>
+    private const int MaxExcerptLines = 5;
 
     private readonly IIndexBuilder _builder;
     private readonly ISourceProvider _source;

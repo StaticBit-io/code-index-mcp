@@ -35,9 +35,11 @@ public sealed class CodeSearchTools
         "more than one project is configured on this server and 'project' is omitted, every " +
         "configured project is searched and the results are merged into one ranked list (each hit " +
         "still names which project it came from); pass 'project' to search only that one. Each " +
-        "hit carries a short excerpt, an 'id' (pass it to code_get_chunk to read the declaration's " +
-        "full body), and a 'score': a Reciprocal-Rank-Fusion value combining the vector and symbol " +
-        "branches, not a raw similarity percentage — higher is better, but the absolute number is " +
+        "hit carries a short excerpt (at most 5 lines from the start of the declaration — enough " +
+        "to judge relevance, not a substitute for the body), an 'id' (pass it to code_get_chunk " +
+        "to read the declaration's full body — expect to need this often, not just occasionally, " +
+        "once the excerpt looks promising), and a 'score': a Reciprocal-Rank-Fusion value combining " +
+        "the vector and symbol branches, not a raw similarity percentage — higher is better, but the absolute number is " +
         "not meaningful on its own. As a rough guide, a hit near 0.03 ranked at or near the top of " +
         "both the semantic and symbol match; a hit near 0.008-0.015 was found by only one branch, " +
         "near the bottom of its ranking, and is a weak match worth a second look before trusting " +
@@ -52,8 +54,10 @@ public sealed class CodeSearchTools
 
     private const string GetChunkDescription =
         "Fetches the full body of one chunk (a complete class/method/property/etc. declaration) " +
-        "by the 'id' returned in a code_search hit. Use this once code_search's excerpt is not " +
-        "enough and you need the whole declaration. An id is opaque and already names its project " +
+        "by the 'id' returned in a code_search hit. code_search's excerpt is deliberately short " +
+        "(at most 5 lines) — call this whenever the excerpt only gets you as far as recognizing " +
+        "the right declaration, which will be often, not just on the rare hit where 5 lines " +
+        "happens to fall short. An id is opaque and already names its project " +
         "(e.g. \"xrpl:3:4137\") — pass it back exactly as code_search returned it; there is no need " +
         "to also pass a separate project parameter. Chunk ids are tied to one project's index as " +
         "it existed at that specific search and do NOT survive a reindex (an explicit " +
@@ -109,11 +113,11 @@ public sealed class CodeSearchTools
     public async Task<string> SearchAsync(
         [Description("Natural-language question or exact identifier/symbol name to search for.")]
         string query,
-        [Description("Maximum number of hits to return. Default 10. Must not be negative (0 is " +
+        [Description("Maximum number of hits to return. Default 5. Must not be negative (0 is " +
             "valid and returns no hits). Not silently capped: a large limit searches deeper into " +
             "both the semantic and symbol branches to try to satisfy it, bounded only by how many " +
             "chunks exist (or match 'kind'/'path_filter').")]
-        int limit = 10,
+        int limit = 5,
         [Description("Optional filter restricting results to one chunk kind: Class, Interface, " +
             "Struct, Record, Enum, Method, Constructor, Property, Field, or FileFragment. " +
             "Case-insensitive. An unrecognized value is ignored silently (no filter is applied) " +

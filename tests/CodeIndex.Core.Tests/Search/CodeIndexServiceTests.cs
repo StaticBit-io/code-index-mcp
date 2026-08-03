@@ -37,9 +37,9 @@ public sealed class CodeIndexServiceTests : IDisposable
         """;
 
     /// <summary>A file whose method body is long enough that the method chunk's line range
-    /// exceeds the 15-line excerpt cap. Returns both the file content and the exact source lines
-    /// used to build it, so tests can compute the expected excerpt/body independently of any
-    /// production code path.</summary>
+    /// exceeds the excerpt cap (<see cref="CodeIndexService"/>'s <c>MaxExcerptLines</c>).
+    /// Returns both the file content and the exact source lines used to build it, so tests can
+    /// compute the expected excerpt/body independently of any production code path.</summary>
     private static (string Content, IReadOnlyList<string> Lines) MakeBigMethodFile(
         string ns, string className, string methodName, int bodyStatementCount)
     {
@@ -96,7 +96,7 @@ public sealed class CodeIndexServiceTests : IDisposable
     }
 
     [Fact]
-    public async Task SearchWithStatusAsync_PopulatesExcerptCappedAtFifteenLines()
+    public async Task SearchWithStatusAsync_PopulatesExcerptCappedAtFiveLines()
     {
         (string content, IReadOnlyList<string> lines) = MakeBigMethodFile("Acme.Big", "Widget", "BigMethod", bodyStatementCount: 20);
         InMemorySourceProvider source = new(new Dictionary<string, string> { ["src/Big.cs"] = content });
@@ -108,13 +108,36 @@ public sealed class CodeIndexServiceTests : IDisposable
         SearchHit hit = Assert.Single(result.Hits, h => h.Chunk.Symbol.EndsWith("BigMethod", StringComparison.Ordinal));
 
         int fullLineCount = hit.Chunk.EndLine - hit.Chunk.StartLine + 1;
-        Assert.True(fullLineCount > 15, "fixture must produce a chunk longer than the excerpt cap");
+        Assert.True(fullLineCount > 5, "fixture must produce a chunk longer than the excerpt cap");
 
         string[] excerptLines = SourceLines.Split(hit.Excerpt);
-        Assert.Equal(15, excerptLines.Length);
+        Assert.Equal(5, excerptLines.Length);
 
-        string[] expectedLines = lines.Skip(hit.Chunk.StartLine - 1).Take(15).ToArray();
+        string[] expectedLines = lines.Skip(hit.Chunk.StartLine - 1).Take(5).ToArray();
         Assert.Equal(expectedLines, excerptLines);
+    }
+
+    [Fact]
+    public async Task SearchWithStatusAsync_ShortChunkExcerptIsNotPaddedToTheCap()
+    {
+        // A one-line method body must come back as exactly its own lines, not padded out to
+        // MaxExcerptLines — the cap is a ceiling, not a target length.
+        InMemorySourceProvider source = new(new Dictionary<string, string>
+        {
+            ["src/Small.cs"] = MakeSimpleFile("Acme.Small", "Widget", "DoSmall"),
+        });
+        CodeIndexService service = CreateService(source, new StubEmbeddingClient(), out _);
+
+        SearchResult result = await service.SearchWithStatusAsync(
+            "DoSmall", limit: 5, kind: null, pathFilter: null, TestContext.Current.CancellationToken);
+
+        SearchHit hit = Assert.Single(result.Hits, h => h.Chunk.Symbol.EndsWith("DoSmall", StringComparison.Ordinal));
+
+        int fullLineCount = hit.Chunk.EndLine - hit.Chunk.StartLine + 1;
+        Assert.True(fullLineCount < 5, "fixture must produce a chunk shorter than the excerpt cap");
+
+        string[] excerptLines = SourceLines.Split(hit.Excerpt);
+        Assert.Equal(fullLineCount, excerptLines.Length);
     }
 
     [Fact]
@@ -198,7 +221,8 @@ public sealed class CodeIndexServiceTests : IDisposable
         Assert.True(methodChunkId >= 0);
         CodeChunk chunk = snapshot.Chunks[methodChunkId];
         int fullLineCount = chunk.EndLine - chunk.StartLine + 1;
-        Assert.True(fullLineCount > 15, "fixture must produce a chunk longer than the excerpt cap");
+        Assert.True(fullLineCount > 5, "fixture must produce a chunk longer than code_search's excerpt cap, " +
+            "to demonstrate GetChunkAsync returns the full body rather than a capped excerpt");
 
         int generation = snapshot.Header.Generation;
         SearchHit? hit = await service.GetChunkAsync(generation, methodChunkId, TestContext.Current.CancellationToken);
