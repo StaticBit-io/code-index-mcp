@@ -13,6 +13,72 @@ permissions:
   contents: read
 
 jobs:
+  # The plugin's version is written down in three places that a client reads
+  # independently, and nothing but this job makes them agree. They have already
+  # drifted silently once: marketplace.json sat at 0.2.1 while plugin.json went
+  # to 0.2.2 and then 0.2.3, so two releases existed that no installed client
+  # was ever offered — the marketplace entry is what a client compares against
+  # to decide whether an update exists, and it never moved.
+  #
+  # Runs as its own job rather than a step inside build-and-test: it needs no
+  # SDK, no restore and no matrix, and a manifest mismatch should be legible on
+  # its own line in the checks list instead of buried in a build log.
+  manifests:
+    name: Manifest versions agree
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+
+      - name: Check plugin version and serverVersion consistency
+        run: |
+          set -euo pipefail
+
+          marketplace='.claude-plugin/marketplace.json'
+          manifest='plugins/code-index/.claude-plugin/plugin.json'
+          checksum='plugins/code-index/bin/server.sha256'
+
+          plugin_version="$(jq -r '.version' "${manifest}")"
+          server_version="$(jq -r '.serverVersion' "${manifest}")"
+          marketplace_version="$(jq -r '.metadata.version' "${marketplace}")"
+          # Selected by name rather than by index so adding a second plugin to
+          # this marketplace later does not silently start checking the wrong
+          # entry.
+          entry_version="$(jq -r '.plugins[] | select(.name == "code-index") | .version' "${marketplace}")"
+          # The committed checksum line is "<sha256>  code-index-server-<v>.tar.gz".
+          # The launcher fetches the asset named after serverVersion and verifies
+          # it against this line, so a serverVersion bump that leaves the file
+          # naming the previous version makes every install refuse to run —
+          # today that is only caught at release time, after the tag is pushed.
+          # tr -d '\r' so a stray CRLF checkout cannot make the version parse
+          # as "0.2.1\r" and fail a comparison that is actually fine.
+          checksum_version="$(tr -d '\r' < "${checksum}" | sed -n 's/.*code-index-server-\(.*\)\.tar\.gz$/\1/p')"
+
+          status=0
+
+          if [ "${marketplace_version}" != "${plugin_version}" ]; then
+            echo "::error file=${marketplace}::marketplace metadata.version (${marketplace_version}) does not match plugin.json version (${plugin_version})"
+            status=1
+          fi
+
+          if [ "${entry_version}" != "${plugin_version}" ]; then
+            echo "::error file=${marketplace}::marketplace code-index entry version (${entry_version}) does not match plugin.json version (${plugin_version})"
+            status=1
+          fi
+
+          if [ "${checksum_version}" != "${server_version}" ]; then
+            echo "::error file=${checksum}::server.sha256 names version ${checksum_version:-<unparseable>}, but plugin.json serverVersion is ${server_version}"
+            status=1
+          fi
+
+          if [ "${status}" -eq 0 ]; then
+            echo "plugin ${plugin_version}, server ${server_version} — all manifests agree"
+          fi
+
+          exit "${status}"
+
   build-and-test:
     name: Build & Test (${{ matrix.os }})
     runs-on: ${{ matrix.os }}
