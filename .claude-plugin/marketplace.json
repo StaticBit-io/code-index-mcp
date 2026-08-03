@@ -6,7 +6,7 @@
   },
   "metadata": {
     "description": "Marketplace for the code-index-mcp plugin — local semantic code search over C# codebases, backed by Ollama embeddings.",
-    "version": "0.2.3"
+    "version": "0.2.1"
   },
   "plugins": [
     {
