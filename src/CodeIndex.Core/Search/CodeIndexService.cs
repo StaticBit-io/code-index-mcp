@@ -396,8 +396,19 @@ public sealed class CodeIndexService
         // sibling remarks for the same "don't truncate before the step that needs the depth" idea
         // applied to filtering instead of diversification.
         IReadOnlyList<ScoredIndex> fused = HybridRanker.Fuse(vectorHits, symbolHits, branchDepth);
+
+        // Every symbol-branch hit is exempt from the per-file cap below — see ResultDiversifier's
+        // remarks on why a literal identifier match (e.g. a query naming a class whose own const
+        // fields also matched) must never be sacrificed to make room for an unrelated chunk that
+        // merely belongs to a still-under-cap file.
+        HashSet<int> symbolHitIndices = new(symbolHits.Count);
+        foreach (ScoredIndex hit in symbolHits)
+        {
+            symbolHitIndices.Add(hit.Index);
+        }
+
         IReadOnlyList<ScoredIndex> diversified = ResultDiversifier.Diversify(
-            fused, index => snapshot.Chunks[index].FilePath, limit);
+            fused, index => snapshot.Chunks[index].FilePath, limit, symbolHitIndices);
 
         // Excerpt reads (and the staleness check alongside each one — see IsExcerptPossiblyStaleAsync)
         // are independent ISourceProvider calls (one file read/stat each), so running them

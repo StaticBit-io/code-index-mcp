@@ -122,4 +122,56 @@ public sealed class ResultDiversifierTests
         Assert.Throws<ArgumentOutOfRangeException>(
             () => ResultDiversifier.Diversify(ranked, _ => "src/A.cs", limit: 5, maxPerFile: 0));
     }
+
+    /// <summary>
+    /// Pins the regression this class's first version caused in <c>SearchQualityTests</c>: a query
+    /// like "TrustSet" legitimately matches three sibling declarations in one file — the class itself
+    /// (an exact/prefix symbol-branch hit) plus two of its own const fields (substring symbol-branch
+    /// hits) — via <see cref="SymbolMatcher"/>. An earlier version of this method capped every
+    /// candidate uniformly, which deferred the class itself (the 3rd hit from that file) once the cap
+    /// filled with its two fields, and backfilled with an unrelated chunk from a different file that
+    /// only happened to still be under its own file's cap — trading the query's own named class away
+    /// for something worse. Marking all three as symbol-branch hits (the <c>exemptIndices</c>
+    /// argument below) must keep them together rather than repeat that trade.
+    /// </summary>
+    [Fact]
+    public void Diversify_SymbolBranchHitsShareAFileBeyondTheCap_AllStayExemptFromCapping()
+    {
+        ScoredIndex[] ranked =
+        [
+            new(0, 0.95f), // TrustSetFlags.cs: ClearNoRipple field (symbol-branch substring hit)
+            new(1, 0.90f), // TrustSetFlags.cs: SetNoRipple field (symbol-branch substring hit)
+            new(2, 0.85f), // TrustSetFlags.cs: TrustSetFlags class itself (symbol-branch prefix hit)
+            new(3, 0.50f), // XrplClient.cs: an unrelated chunk that merely isn't over its own cap
+        ];
+
+        string FilePathOf(int index) => index <= 2 ? "src/TrustSetFlags.cs" : "src/XrplClient.cs";
+        HashSet<int> symbolBranchHits = [0, 1, 2];
+
+        IReadOnlyList<ScoredIndex> diversified = ResultDiversifier.Diversify(
+            ranked, FilePathOf, limit: 3, exemptIndices: symbolBranchHits);
+
+        // All three same-file symbol-branch hits survive, in their original rank order — the
+        // unrelated 4th-ranked chunk from a different file never gets to displace any of them.
+        Assert.Equal([0, 1, 2], diversified.Select(r => r.Index));
+    }
+
+    [Fact]
+    public void Diversify_ExemptCandidateDoesNotConsumeItsFilesNonExemptQuota()
+    {
+        // A file with one exempt hit (rank 0) and two non-exempt vector-only hits (ranks 1, 2):
+        // the exempt hit must not count toward the file's cap, so both non-exempt hits still
+        // compete for the cap exactly as if the exempt one belonged to a different file entirely.
+        ScoredIndex[] ranked = [new(0, 0.9f), new(1, 0.8f), new(2, 0.7f), new(3, 0.6f)];
+
+        string FilePathOf(int index) => index <= 2 ? "src/Shared.cs" : "src/Other.cs";
+        HashSet<int> exempt = [0];
+
+        IReadOnlyList<ScoredIndex> diversified = ResultDiversifier.Diversify(
+            ranked, FilePathOf, limit: 3, exemptIndices: exempt);
+
+        // The exempt hit (0) plus both non-exempt hits (1, 2) fit within the default cap of 2 for
+        // the non-exempt count, so index 3 (a different file) is never needed to fill the 3 slots.
+        Assert.Equal([0, 1, 2], diversified.Select(r => r.Index));
+    }
 }
