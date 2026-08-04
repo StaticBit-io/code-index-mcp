@@ -557,6 +557,146 @@ public sealed class CodeIndexServiceTests : IDisposable
         Assert.Equal("Acme.A.Widget.DoA", hit!.Chunk.Symbol);
     }
 
+    /// <summary>
+    /// End-to-end reproduction of the diversity defect measured against the real <c>wallet</c>
+    /// project: a query about app-lifecycle/auto-lock wiring put four hits from two central files
+    /// (<c>App.xaml.cs</c>, <c>AuthStateProvider.cs</c>) into 4 of 5 result slots at <c>limit=5</c>,
+    /// leaving room for only one of several genuinely distinct peripheral platform files (iOS
+    /// background handling, the Windows-only auto-lock wiring in
+    /// <c>Platforms/Windows/App.xaml.cs</c>, the web app's lifecycle bridge) even though each of
+    /// them ranked above the dominant file's own 3rd/4th members. This fixture reproduces that shape
+    /// with <see cref="RankedMarkerEmbeddingClient"/> standing in for the real embedding model: one
+    /// dominant file ("A") supplies the four highest-ranked vector hits, three other files ("C",
+    /// "D", "E") each supply exactly one hit, ranked just below "A"'s. Before
+    /// <see cref="ResultDiversifier"/> existed, <c>SearchWithStatusAsync(limit: 5)</c> returned four
+    /// hits from "A" and only "C" — "D" and "E" never appeared at all. The fix must cap "A" at two
+    /// and surface all three peripheral files.
+    /// </summary>
+    [Fact]
+    public async Task SearchWithStatusAsync_FileCrowding_DoesNotLetOneFileFillMostOfASmallLimit()
+    {
+        InMemorySourceProvider source = new(new Dictionary<string, string>
+        {
+            ["src/A.cs"] = MakeMultiMethodFile("Acme.A", "Dominant",
+                RankedMarkerEmbeddingClient.MarkerForRank(0), RankedMarkerEmbeddingClient.MarkerForRank(1),
+                RankedMarkerEmbeddingClient.MarkerForRank(2), RankedMarkerEmbeddingClient.MarkerForRank(3)),
+            ["src/C.cs"] = MakeMultiMethodFile("Acme.C", "PeripheralC", RankedMarkerEmbeddingClient.MarkerForRank(4)),
+            ["src/D.cs"] = MakeMultiMethodFile("Acme.D", "PeripheralD", RankedMarkerEmbeddingClient.MarkerForRank(5)),
+            ["src/E.cs"] = MakeMultiMethodFile("Acme.E", "PeripheralE", RankedMarkerEmbeddingClient.MarkerForRank(6)),
+        });
+
+        RankedMarkerEmbeddingClient embedder = new();
+        CodeIndexService service = CreateService(source, embedder, out _);
+
+        // Restricted to ChunkKind.Method: each fixture class also produces its own Class-kind
+        // chunk (whose embed text happens to include its members' names too, so it inherits the
+        // strongest contained marker's score) — a second, incidental candidate per file that would
+        // otherwise obscure the one-method-per-file shape this test is deliberately built around.
+        // BuildCandidateIndices applies this filter before either search branch runs, so it does
+        // not interact with diversification itself.
+        SearchResult result = await service.SearchWithStatusAsync(
+            "a query sentence that matches no symbol literally, so only the vector branch scores anything",
+            limit: 5, kind: ChunkKind.Method, pathFilter: null, TestContext.Current.CancellationToken);
+
+        Assert.Equal(5, result.Hits.Count);
+
+        Assert.Equal(2, result.Hits.Count(h => h.Chunk.FilePath == "src/A.cs"));
+        // The two strongest members of the dominant file are still both present...
+        Assert.Contains(result.Hits, h => h.Chunk.FilePath == "src/A.cs" &&
+            h.Chunk.Symbol.Contains(RankedMarkerEmbeddingClient.MarkerForRank(0), StringComparison.Ordinal));
+        Assert.Contains(result.Hits, h => h.Chunk.FilePath == "src/A.cs" &&
+            h.Chunk.Symbol.Contains(RankedMarkerEmbeddingClient.MarkerForRank(1), StringComparison.Ordinal));
+
+        // ...and now every peripheral file gets its one relevant hit — not just the single one
+        // ("C") a plain, non-diversified Take(5) would still have reached.
+        Assert.Contains(result.Hits, h => h.Chunk.FilePath == "src/C.cs");
+        Assert.Contains(result.Hits, h => h.Chunk.FilePath == "src/D.cs");
+        Assert.Contains(result.Hits, h => h.Chunk.FilePath == "src/E.cs");
+    }
+
+    /// <summary>A file with several methods, one per marker in <paramref name="methodMarkers"/> —
+    /// each method's name embeds the marker so <see cref="RankedMarkerEmbeddingClient"/> can key
+    /// its vector off it (the chunk's embed text includes the method's own symbol name).</summary>
+    private static string MakeMultiMethodFile(string ns, string className, params string[] methodMarkers)
+    {
+        string methods = string.Join('\n', methodMarkers.Select((marker, i) => $$"""
+                public int Do{{marker}}_{{i}}()
+                {
+                    return {{i}};
+                }
+            """));
+
+        return $$"""
+            namespace {{ns}}
+            {
+                public class {{className}}
+                {
+            {{methods}}
+                }
+            }
+            """;
+    }
+
+    /// <summary>
+    /// A fully controllable stand-in for a real embedding backend, giving each of up to <see
+    /// cref="RankCount"/> markers a distinct, strictly decreasing cosine similarity against every
+    /// query — unlike <see cref="StubEmbeddingClient"/> (essentially random) or
+    /// <see cref="MarkerBasedEmbeddingClient"/> (only three fixed similarities), this is what
+    /// <see cref="SearchWithStatusAsync_FileCrowding_DoesNotLetOneFileFillMostOfASmallLimit"/> needs
+    /// to construct an exact, known rank order spanning more than a couple of files. Every query
+    /// embeds to the same reference direction; a passage embeds along that same direction at an
+    /// angle proportional to its marker's rank, so rank 0 is the strongest match and rank
+    /// <see cref="RankCount"/> - 1 the weakest, with nothing tied.
+    /// </summary>
+    private sealed class RankedMarkerEmbeddingClient : IEmbeddingClient
+    {
+        private const int RankCount = 8;
+
+        /// <summary>Small enough that even the weakest rank's cosine similarity stays comfortably
+        /// positive (well clear of 0), so ordering — not sign — is the only thing under test.</summary>
+        private const double AngleStepRadians = 0.08;
+
+        public static string MarkerForRank(int rank) => $"RANK{rank}MARKER";
+
+        public int Dimensions => 2;
+
+        public string Model => "ranked-marker-test-model";
+
+        public Task<IReadOnlyList<float[]>> EmbedAsync(IReadOnlyList<string> inputs, CancellationToken cancellationToken = default)
+        {
+            float[][] vectors = new float[inputs.Count][];
+            for (int i = 0; i < inputs.Count; i++)
+            {
+                vectors[i] = VectorFor(inputs[i]);
+            }
+
+            return Task.FromResult<IReadOnlyList<float[]>>(vectors);
+        }
+
+        public Task<float[]> EmbedQueryAsync(string query, CancellationToken cancellationToken = default) =>
+            Task.FromResult(AngleVector(0));
+
+        private static float[] VectorFor(string text)
+        {
+            for (int rank = 0; rank < RankCount; rank++)
+            {
+                if (text.Contains(MarkerForRank(rank), StringComparison.Ordinal))
+                {
+                    return AngleVector(rank);
+                }
+            }
+
+            // No recognised marker: embed far off-axis so it never outranks a marked passage.
+            return [0f, 1f];
+        }
+
+        private static float[] AngleVector(int rank)
+        {
+            double angle = rank * AngleStepRadians;
+            return [(float)Math.Cos(angle), (float)Math.Sin(angle)];
+        }
+    }
+
     [Fact]
     public async Task SearchWithStatusAsync_RelevanceFloor_ExcludesAWeakVectorMatchButKeepsAStrongOne()
     {
