@@ -112,6 +112,19 @@ public sealed class VectorSearcher
     /// instead of only ever measuring them bundled together (see
     /// <c>VectorSearcherTests.Search_At8735By1024RealisticScale_CompletesWithinAGenerousBound</c>
     /// for why that bundling made the benchmark's heap-vs-full-sort ratio noisy).
+    ///
+    /// <para>
+    /// This split is not free, and the cost lands on the production path rather than the test:
+    /// the previous fused loop scored and offered each row to the heap in one pass and so never
+    /// held more than <c>topK</c> entries, whereas materialising every score first makes a
+    /// search allocate an <see cref="float"/> array of <see cref="Count"/> elements. Memory per
+    /// search goes from O(topK) to O(N). At this project's measured scale that is 8735 floats,
+    /// about 35 KB of short-lived Gen0 garbage per query, against a query that spends roughly
+    /// 190 ms waiting for Ollama to embed the text and about 1.6 ms searching — immaterial, and
+    /// measured to be so rather than assumed. It would stop being immaterial on an index one or
+    /// two orders of magnitude larger, at which point fusing the two steps back together for the
+    /// production path (keeping them separate only for the benchmark) is the fix.
+    /// </para>
     /// </remarks>
     internal float[] ComputeScores(ReadOnlySpan<float> query)
     {
