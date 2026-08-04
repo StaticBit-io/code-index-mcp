@@ -23,12 +23,14 @@ short, ranked list of the declarations that actually matter — not every line t
 contain a string. The index refreshes itself incrementally before every search, so results always
 reflect the current state of the tree.
 
-This only saves *search*. If a task genuinely requires reading eight files in full, they still
-have to be read; output tokens are unaffected. The size of the saving was originally reasoned from
-the mechanism rather than measured — an external reviewer correctly called that out. It has since
-been measured on 20 paired agent runs and the honest number is much smaller than the original
-"a third to a half" guess, and negative in two of the three query categories tested: see
-[Token savings: measured, not estimated](#token-savings-measured-not-estimated) below.
+**It does not save tokens.** That claim was in this README, was reasoned from the mechanism rather
+than measured, and an external reviewer correctly called it out. Four paired-agent measurements
+across two corpora since then all point the same way: a competent `Grep`/`Glob`/`Read` agent is
+cheaper — currently by roughly 10–15% — and finds slightly *more* of the relevant code. What this
+tool reliably does is reach an answer in fewer searches, which is worth having when you have no
+identifier to guess at, and is worth nothing when you do. The full numbers, the noise floor, and the
+one task shape where it does win are in
+[Cost and accuracy](#cost-and-accuracy-what-four-measurements-actually-showed) below.
 
 ## Requirements
 
@@ -355,73 +357,144 @@ between the original estimates and what was actually measured.
 
 The cold number is why `Embedding:KeepAlive` exists — see the next section.
 
-## Token savings: measured, not estimated
+## Cost and accuracy: what four measurements actually showed
 
-The original claim in this README — "roughly a third to a half" of input tokens saved on
-search-heavy sessions — was reasoned from the mechanism (fewer wrong files opened, fewer broad
-sweeps) and never actually measured. An external reviewer pointed that out. This section replaces
-it with a real measurement.
+This README once claimed semantic search saved "roughly a third to a half" of input tokens on
+search-heavy sessions. That was reasoned from the mechanism — fewer wrong files opened, fewer broad
+sweeps — and never measured. An external reviewer said so, and he was right. Everything below
+replaces it.
 
-**Note:** this measurement predates the `limit`/excerpt-length defaults documented above (it ran
-against `limit=10` and a 15-line excerpt cap, since lowered to `5` and 5 lines respectively — see
-`code_search`'s per-hit payload). A re-run against the current defaults has not been done; treat
-the numbers below as the shape of the trade-off, not as still-current absolute figures.
+**The short version: it does not save tokens.** On both corpora tested, a competent
+`Grep`/`Glob`/`Read` agent was cheaper. Reducing the per-call payload roughly halved the gap but did
+not close it. Accuracy is slightly worse, not better. The tool's real case is narrower than the one
+originally advertised, and it is stated at the end of this section.
 
-**Method.** 10 pairs of subagents (20 agents total, one Claude Code session each) were given the
-*same* task text and pointed at the same indexed C# repository (`XrplCSharp`, 773 files, 8,988
-chunks, this same server). One member of each pair could use only `Grep`/`Glob`/`Read`; the other
-could use only `code_search`/`code_get_chunk` plus `Read`. Both were told to work efficiently and
-stop once confident, then state a final answer (file + line range) and their own tool-call count.
-Each agent's actual token usage was read from its own run, not estimated. Every answer was then
-independently verified by reading the cited code, not by whether the answer sounded plausible.
-Tasks were deliberately split into three categories to test the hypothesis that semantic search
-should win when no exact identifier is given, tie or lose when one is, and either pay for itself
-or not on questions that span several files:
+### Method
 
-| # | Task (category) | Grep tokens | Semantic tokens | Δ semantic vs. grep | Both correct? |
-|---|---|---:|---:|---:|:---:|
-| A1 | Where is a transaction's fee computed (intent, no identifier) | 86,227 | 85,451 | −0.9% | yes |
-| A2 | How does the client decide a request timed out (intent) | 88,042 | 89,615 | +1.8% | yes |
-| A3 | How does the client auto-reconnect after a dropped socket (intent) | 84,080 | 84,205 | +0.1% | yes |
-| B1 | Where is `TrustSetFlags` defined and used (exact symbol) | 79,770 | 91,314 | +14.5% | yes |
-| B2 | Where is `XrplErrorCategory` defined and used (exact symbol) | 77,338 | 90,330 | +16.8% | yes |
-| B3 | Where is `LedgerEntryType` defined — a trap, two distinct types exist (exact symbol) | 82,974 | 84,385 | +1.7% | yes |
-| B4 | Where is `AccountRootFlags` defined and used (exact symbol) | 76,153 | 98,208 | +29.0% | yes |
-| C1 | How is `AMMDeposit` validated end to end (spans files) | 86,647 | 112,189 | +29.5% | yes |
-| C2 | How is `NFTokenMint` validated end to end (spans files) | 91,320 | 95,408 | +4.5% | yes |
-| C3 | How does multi-sign + combine work end to end (spans files) | 106,522 | 93,264 | −12.4% | yes |
-| | **Total** | **859,073** | **924,369** | **+7.6%** | **20/20** |
+Paired subagents. Both members of a pair get **identical task text**; one is restricted to
+`Grep`/`Glob`/`Read`, the other to `code_search`/`code_get_chunk`/`Read`. Token usage is read from
+each agent's own completion metadata, never estimated. Answers are verified by reading the cited
+code.
 
-**The honest result: semantic search cost more tokens than `Grep`/`Glob`/`Read` overall, in this
-sample — a 7.6% loss, not a third-to-half saving.** Both members reached a correct, independently
-verified answer on all 20 tasks, so the difference is pure token cost, not one side failing and
-retrying. Per category:
+From the third measurement onward, correctness is scored against a **verified answer key** — about
+120 assertions across the six tasks, each with a `path:line`, marked required or bonus, with known
+traps and genuinely ambiguous points flagged so neither side is scored on them. Hits, misses and
+**false assertions** are counted separately, because "incomplete" and "confidently wrong" are
+different failures.
 
-- **Intent-only questions (A), no identifier given** — roughly a wash (+0.36% for semantic,
-  i.e. no measurable saving either way). The expectation was that this is where semantic search
-  should win; it didn't, in this codebase.
-- **Exact-symbol lookups (B)** — semantic search lost clearly, using **15.2% more** tokens than
-  `Grep`. This matches expectations: a literal identifier is exactly what `Grep` is built for.
-- **Multi-file concept questions (C)**, where semantic search was expected to pay for itself —
-  it lost here too, using **5.75% more** tokens, driven mostly by task C1 where the semantic
-  agent made more tool calls chasing the same answer `Grep` reached faster.
+### Measurement 1 — `XrplCSharp`, 10 short tasks
 
-**Why `Grep` did this well here:** `XrplCSharp` uses consistent, descriptive C# naming
-(`ValidateAMMDeposit`, `ReconnectLoopAsync`, `CalculateFeePerTransactionType`) — a skilled agent
-can often guess a good literal substring on the first try, which is close to the best case for
-plain text search. Task C3 is the one clear semantic win in this sample (−12.4%): the correct
-answer was split across three files with no single obviously-greppable shared term
-(`Signer.Multisign`, `XrplWallet.SignMulti`, `CoSigningEngine.Combine`), which is closer to the
-scenario semantic search is meant for.
+| | Grep | Semantic | Δ |
+|---|---:|---:|---:|
+| Total | 859,073 | 924,369 | **+7.6%** |
 
-**Caveats.** This is one corpus (a single well-named C# SDK), one language, 10 tasks, and
-subagent-measured overhead that differs from a real interactive session (no back-and-forth
-follow-up questions, no context accumulated from earlier turns). A codebase with less consistent
-naming, or a session with many more searches where index warm-up cost amortizes further, could
-shift these numbers in either direction. Treat "semantic search adds token overhead on
-well-named codebases, and pays off mainly on multi-file questions with no shared vocabulary" as
-the current best-supported claim, not a universal one — and reach for `Grep` first when you already
-have a good guess at the identifier or file name.
+All 20 answers correct. Semantic lost worst on exact-symbol lookups (+15.2%) — expected, that is
+what `Grep` is for — and won once (−12.4%) on a three-file question with no shared greppable term.
+Ran against the old defaults (`limit=10`, 15-line excerpts).
+
+### Measurement 2 — `Wallet.git`, 6 long tasks
+
+A .NET/Blazor application rather than an SDK, with tasks requiring 5–15 tool calls each.
+
+**The first attempt was invalidated.** The index had been inflated ~5x by nested git worktrees that
+`FileSystemSourceProvider` did not exclude — 4,514 files instead of 907. Duplicated hits cost
+`code_search` a full excerpt each time while `Grep` skipped them cheaply. That bug is fixed; the run
+was discarded and repeated on a clean index rather than published with a caveat.
+
+| | Grep | Semantic | Δ |
+|---|---:|---:|---:|
+| Clean index, old defaults | 679,242 | 854,083 | **+25.7%** |
+
+Semantic search lost all six tasks. Per-call cost was the mechanism: **9,086 tokens per call against
+`Grep`'s 5,348**, while making 26% *fewer* calls. It found things in fewer searches and lost on what
+each search returned.
+
+### The change that followed
+
+Excerpts cut from 15 lines to 5, default `limit` from 10 to 5 — measured at **−54.6%** response size
+on eight representative queries. Every hit already carries `signature` and `doc` as separate fields,
+and `code_get_chunk` exists for the body.
+
+### Measurements 3 and 4 — the same configuration, twice
+
+| | Grep | Semantic | Δ |
+|---|---:|---:|---:|
+| Run 3 | 744,219 | 802,098 | +7.8% |
+| Run 4 (control, nothing changed) | 684,402 | 789,009 | +15.3% |
+
+**Two identical configurations differed by 7.5 percentage points.** That is the noise floor, and it
+is why the +7.8% figure should not be quoted on its own — it caught a cheap run of the baseline.
+
+The noise is almost entirely in the **`Grep` arm**: 744,219 vs 684,402 (8.7% apart) against
+semantic's 802,098 vs 789,009 (1.7% apart). The tool under test reproduces; the yardstick moves.
+
+Averaged over three runs of the unchanged `Grep` arm (702,621 tokens):
+
+| | vs. `Grep` mean | tokens per call |
+|---|---:|---:|
+| Semantic, old defaults | +21.6% | 9,086 |
+| Semantic, current defaults | **+13.2%** | 5,888–6,218 |
+| `Grep` | — | 4,820–5,348 |
+
+The payload cut removed about half the gap. Note the asymmetry: response size fell 54.6% but total
+cost fell ~7%, because a subagent's fixed context dominates its token bill. **Further payload
+tuning has little left to give** — this is why no second round of it was attempted.
+
+### Accuracy
+
+Scored against the answer key, both runs of the current build:
+
+| | hits | misses | false | bonus |
+|---|---:|---:|---:|---:|
+| `Grep`, run 3 | 73 | 9 | 1 | 18 |
+| `Grep`, run 4 | 72 | 8 | 3 | 16 |
+| Semantic, run 3 | 67 | 13 | 2 | 12 |
+| Semantic, run 4 | 67 | 15 | 1 | 9.5 |
+
+**Coverage reproduces**: `Grep` finds ~88% of required facts, semantic ~82%. Semantic scored
+*exactly* 67 both times.
+
+**The false-assertion rate does not reproduce.** Run 3 was worse for semantic (2 vs 1), run 4 worse
+for `Grep` (3 vs 1). The hypothesis that a cheaper tool buys more confident wrongness is **not
+supported** by this data.
+
+The reproducible weakness is different and more specific: **semantic ranking under-retrieves
+peripheral files** — platform-guarded variants, alternative implementations, parallel code paths.
+Across both runs the semantic arm never opened `Platforms\Windows\App.xaml.cs` when tracing a
+lifecycle feature that has a distinct Windows path, and missed a second failure route that existed
+alongside the main one. These files are *about* the topic but are not the main place it happens, and
+similarity ranking sinks them.
+
+### What holds
+
+- Semantic search costs roughly **10–15% more** than a competent `Grep` agent on these corpora, with
+  a noise band of several points. It is not a token-saving tool.
+- It reliably makes **fewer tool calls** — the mechanism works; the payload per call is what costs.
+- It is **slightly less complete** (82% vs 88% of required facts), reproducibly so.
+- It is **not less honest** — no measurable difference in false claims.
+- It wins on some task shapes. Tracing one feature through several layers with no shared vocabulary
+  favoured it reproducibly (−11% to −14% across two runs).
+
+### What this means in practice
+
+**Reach for `Grep` first whenever you can guess a plausible identifier, file name, or path.** On a
+well-named C# codebase that is most of the time, and it is both cheaper and more thorough.
+
+**Reach for `code_search` when you genuinely cannot** — an unfamiliar area, a concept with no
+obvious shared term, a feature whose implementation is spread across layers. That is a real case,
+and it is the one this tool serves.
+
+**Do not expect it to find the odd corner.** Platform-specific files, dead alternates, and secondary
+code paths are exactly what it ranks lowest. If completeness matters — "find *every* caller",
+"is this handled on all platforms" — verify with `Grep`.
+
+### Caveats
+
+Two corpora, one language, 6–10 tasks per run, four runs total. Subagent overhead differs from an
+interactive session: no follow-up turns, no context carried across a conversation. Two of the six
+tasks (`T2`, `T3`) produced results that changed sign between runs and carry no information on their
+own; the aggregate is what should be read. Accuracy has two data points, enough to show that
+coverage reproduces and that false-assertion rates do not, not enough for a confidence interval.
 
 ## Search quality: the query instruction prefix
 
