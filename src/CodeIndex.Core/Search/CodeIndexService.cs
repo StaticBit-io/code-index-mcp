@@ -390,19 +390,26 @@ public sealed class CodeIndexService
             warning = CombineWarnings(warning, RankingDegradedMessage(ex));
         }
 
-        IReadOnlyList<ScoredIndex> fused = HybridRanker.Fuse(vectorHits, symbolHits, limit);
+        // Fused deep (branchDepth, not just `limit`) so ResultDiversifier below has more than
+        // exactly `limit` candidates to redistribute across files — diversifying a list already
+        // truncated to `limit` would have nothing left to backfill from. See BuildCandidateIndices'
+        // sibling remarks for the same "don't truncate before the step that needs the depth" idea
+        // applied to filtering instead of diversification.
+        IReadOnlyList<ScoredIndex> fused = HybridRanker.Fuse(vectorHits, symbolHits, branchDepth);
+        IReadOnlyList<ScoredIndex> diversified = ResultDiversifier.Diversify(
+            fused, index => snapshot.Chunks[index].FilePath, limit);
 
         // Excerpt reads (and the staleness check alongside each one — see IsExcerptPossiblyStaleAsync)
         // are independent ISourceProvider calls (one file read/stat each), so running them
         // concurrently instead of one-at-a-time keeps this linear in wall-clock file I/O only for
         // the slowest read, not the sum of all of them — worth doing now that `limit` (and
-        // therefore fused.Count) is no longer capped at a small fixed branch depth.
+        // therefore diversified.Count) is no longer capped at a small fixed branch depth.
         Dictionary<string, FileFingerprint> fingerprintByPath = BuildFingerprintLookup(snapshot);
-        Task<string>[] excerptTasks = new Task<string>[fused.Count];
-        Task<bool>[] stalenessTasks = new Task<bool>[fused.Count];
-        for (int i = 0; i < fused.Count; i++)
+        Task<string>[] excerptTasks = new Task<string>[diversified.Count];
+        Task<bool>[] stalenessTasks = new Task<bool>[diversified.Count];
+        for (int i = 0; i < diversified.Count; i++)
         {
-            CodeChunk chunk = snapshot.Chunks[fused[i].Index];
+            CodeChunk chunk = snapshot.Chunks[diversified[i].Index];
             excerptTasks[i] = ReadExcerptAsync(chunk, cancellationToken);
             stalenessTasks[i] = IsExcerptPossiblyStaleAsync(
                 fingerprintByPath.GetValueOrDefault(chunk.FilePath), chunk.FilePath, cancellationToken);
@@ -417,10 +424,10 @@ public sealed class CodeIndexService
         string[] excerpts = excerptsTask.Result;
         bool[] staleFlags = stalenessTask.Result;
 
-        List<SearchHit> hits = new(fused.Count);
-        for (int i = 0; i < fused.Count; i++)
+        List<SearchHit> hits = new(diversified.Count);
+        for (int i = 0; i < diversified.Count; i++)
         {
-            ScoredIndex scored = fused[i];
+            ScoredIndex scored = diversified[i];
             hits.Add(new SearchHit
             {
                 ChunkId = scored.Index,
