@@ -89,6 +89,36 @@ public sealed class ResultDiversifierTests
     }
 
     [Fact]
+    public void Diversify_BackfilledCandidate_IsReturnedAtItsOwnRankNotAppendedLast()
+    {
+        // Regression: backfill runs after the capped pass, so appending a deferred candidate
+        // directly put it behind every hit selected after it was deferred — index 2 came back
+        // as [0, 1, 3, 2], a rank-3 hit presented below the rank-4 hit that had displaced it.
+        // The `score` field still said otherwise, so the output claimed an ordering it did not
+        // have. Diversification decides *which* hits come back; it must not reorder them.
+        ScoredIndex[] ranked = [new(0, 0.9f), new(1, 0.8f), new(2, 0.7f), new(3, 0.6f)];
+
+        IReadOnlyList<ScoredIndex> diversified = ResultDiversifier.Diversify(
+            ranked,
+            index => index == 3 ? "src/Other.cs" : "src/Crowded.cs",
+            limit: 4,
+            maxPerFile: 2);
+
+        Assert.Equal([0, 1, 2, 3], diversified.Select(r => r.Index));
+
+        // Stated as the invariant rather than just the literal expectation above: scores must
+        // never increase as the caller reads down the list.
+        float[] scores = [.. diversified.Select(r => r.Score)];
+        for (int i = 1; i < scores.Length; i++)
+        {
+            Assert.True(
+                scores[i] <= scores[i - 1],
+                $"Result {i} scored {scores[i]} against {scores[i - 1]} at position {i - 1} — " +
+                "diversified output must stay ordered by descending score.");
+        }
+    }
+
+    [Fact]
     public void Diversify_NoCrowding_PreservesOriginalRankOrder()
     {
         ScoredIndex[] ranked = [new(0, 0.9f), new(1, 0.8f), new(2, 0.7f), new(3, 0.6f)];

@@ -129,16 +129,26 @@ public static class ResultDiversifier
             return ranked;
         }
 
-        List<ScoredIndex> selected = new(Math.Min(limit, ranked.Count));
-        List<ScoredIndex>? deferred = null;
+        // Selection is recorded as flags over `ranked`'s own positions rather than by appending
+        // to an output list, so the result can be emitted in the input's order at the end. This
+        // matters because backfill runs after the capped pass: appending a deferred candidate
+        // directly would place a rank-3 hit *behind* the rank-4 hit that displaced it, and the
+        // tool's output would stop being ordered by relevance even though its `score` field still
+        // said otherwise. Diversification is meant to change *which* hits come back, never the
+        // order they are presented in.
+        bool[] isSelected = new bool[ranked.Count];
+        int selectedCount = 0;
+        List<int>? deferredOrdinals = null;
         Dictionary<string, int> perFileCount = new(StringComparer.Ordinal);
 
-        foreach (ScoredIndex candidate in ranked)
+        for (int ordinal = 0; ordinal < ranked.Count; ordinal++)
         {
-            if (selected.Count == limit)
+            if (selectedCount == limit)
             {
                 break;
             }
+
+            ScoredIndex candidate = ranked[ordinal];
 
             if (exemptIndices is not null && exemptIndices.Contains(candidate.Index))
             {
@@ -146,7 +156,8 @@ public static class ResultDiversifier
                 // file's chunks are already selected — and does not itself consume any of the
                 // file's non-exempt quota, so it can never be the reason a later, genuinely
                 // vector-only sibling gets deferred.
-                selected.Add(candidate);
+                isSelected[ordinal] = true;
+                selectedCount++;
                 continue;
             }
 
@@ -155,25 +166,38 @@ public static class ResultDiversifier
 
             if (countSoFar < maxPerFile)
             {
-                selected.Add(candidate);
+                isSelected[ordinal] = true;
+                selectedCount++;
                 perFileCount[filePath] = countSoFar + 1;
             }
             else
             {
-                (deferred ??= []).Add(candidate);
+                (deferredOrdinals ??= []).Add(ordinal);
             }
         }
 
-        if (selected.Count < limit && deferred is not null)
+        // Backfill in rank order, so when the cap leaves slots unfilled the strongest deferred
+        // candidates are the ones that come back — never an arbitrary subset.
+        if (selectedCount < limit && deferredOrdinals is not null)
         {
-            foreach (ScoredIndex candidate in deferred)
+            foreach (int ordinal in deferredOrdinals)
             {
-                if (selected.Count == limit)
+                if (selectedCount == limit)
                 {
                     break;
                 }
 
-                selected.Add(candidate);
+                isSelected[ordinal] = true;
+                selectedCount++;
+            }
+        }
+
+        List<ScoredIndex> selected = new(selectedCount);
+        for (int ordinal = 0; ordinal < ranked.Count; ordinal++)
+        {
+            if (isSelected[ordinal])
+            {
+                selected.Add(ranked[ordinal]);
             }
         }
 
