@@ -243,13 +243,31 @@ public sealed class VectorSearcherTests
     }
 
     /// <summary>
-    /// Realistic-scale timing at 8735 chunks x 1024 dimensions — the measured production
-    /// scale for this project. Reports the elapsed time for both the bounded-heap search and a
-    /// reference full sort to the test log, and asserts the two return identical results plus
-    /// a bound generous enough to not flake on a slow CI run while still being tight enough to
-    /// catch a real regression (a naive full sort at this scale would already be within this
-    /// bound, so it is not a meaningless tautology either).
+    /// Realistic-scale timing at 8735 chunks x 1024 dimensions — the measured production scale
+    /// for this project. Reports the elapsed time for both selection strategies to the test log,
+    /// asserts the full pipeline (score + select) matches a reference full sort, and separately
+    /// asserts a bound on the heap/full-sort ratio tight enough to catch a real regression.
     /// </summary>
+    /// <remarks>
+    /// This test originally timed <c>searcher.Search(...)</c> (score + select fused) against a
+    /// reference that recomputed the same ~8735 x 1024 dot products and then did a full sort —
+    /// i.e. it measured "dot products + heap" against "dot products + full sort". Both paths pay
+    /// the identical, dominant dot-product cost, so in theory it should cancel out of the ratio.
+    /// In practice it did not always cancel: on one CI run the ratio spiked to 2.112 against a
+    /// 1.5 ceiling (issue #32), immediately passing on an identical re-run, while the full-sort
+    /// side's absolute time barely moved from its usual local value — pointing at something
+    /// landing specifically inside the heap path's measured window on that run (most likely GC
+    /// or scheduler noise from concurrent test collections, given xUnit's default
+    /// parallel-by-collection execution), not a real difference between the two algorithms.
+    ///
+    /// Rather than widen the ceiling to paper over that, this version computes the ~8735 x 1024
+    /// scores once via <see cref="VectorSearcher.ComputeScores"/>, outside every timed region,
+    /// and times only <see cref="VectorSearcher.SelectTopKFromScores"/> against a full sort of
+    /// that same fixed scores array. That is what the assertion has always claimed to compare —
+    /// see <see cref="FullSortSelectTopK"/>, which is now the direct counterpart to
+    /// <see cref="VectorSearcher.SelectTopKFromScores"/> rather than to the whole of
+    /// <see cref="VectorSearcher.Search"/>.
+    /// </remarks>
     [Fact]
     public void Search_At8735By1024RealisticScale_CompletesWithinAGenerousBound()
     {
@@ -264,8 +282,19 @@ public sealed class VectorSearcherTests
         float[] query = CreateRandomUnitVectors(1, dimensions, seed: 99);
         VectorSearcher searcher = new(vectors, dimensions);
 
-        IReadOnlyList<ScoredIndex> hits = [];
-        ScoredIndex[] reference = [];
+        // The ~8735 x 1024 SIMD dot-product pass: identical work for either selection strategy,
+        // and the dominant cost of an end-to-end search. Computed once, here, outside every
+        // timed region below, so the loop measures only the two selection strategies against
+        // each other instead of diluting (and, per issue #32, occasionally skewing) the ratio
+        // with several milliseconds of cost neither strategy can avoid or differ on.
+        float[] scores = searcher.ComputeScores(query);
+
+        // Correctness: the full pipeline (score + select) still has to match a plain full sort
+        // of the same scores.
+        IReadOnlyList<ScoredIndex> hits = searcher.Search(query, topK);
+        ScoredIndex[] reference = FullSortSelectTopK(scores, topK);
+        Assert.Equal(topK, hits.Count);
+        Assert.Equal(reference, hits);
 
         // Tiered JIT compilation needs more than one call to reach steady-state optimised
         // code, and a single measured call (as this test originally took) can land mid-tier
@@ -274,8 +303,8 @@ public sealed class VectorSearcherTests
         // to see through GC pauses and scheduler noise in a micro-benchmark like this one.
         for (int i = 0; i < warmupRuns; i++)
         {
-            hits = searcher.Search(query, topK);
-            reference = FullSortReferenceSearch(vectors, dimensions, query, topK);
+            _ = VectorSearcher.SelectTopKFromScores(scores, topK, float.NegativeInfinity);
+            _ = FullSortSelectTopK(scores, topK);
         }
 
         double heapMs = double.MaxValue;
@@ -284,52 +313,62 @@ public sealed class VectorSearcherTests
         for (int i = 0; i < measuredRuns; i++)
         {
             Stopwatch heapStopwatch = Stopwatch.StartNew();
-            hits = searcher.Search(query, topK);
+            _ = VectorSearcher.SelectTopKFromScores(scores, topK, float.NegativeInfinity);
             heapStopwatch.Stop();
             heapMs = Math.Min(heapMs, heapStopwatch.Elapsed.TotalMilliseconds);
 
             Stopwatch fullSortStopwatch = Stopwatch.StartNew();
-            reference = FullSortReferenceSearch(vectors, dimensions, query, topK);
+            _ = FullSortSelectTopK(scores, topK);
             fullSortStopwatch.Stop();
             fullSortMs = Math.Min(fullSortMs, fullSortStopwatch.Elapsed.TotalMilliseconds);
         }
 
         _output.WriteLine(
-            $"VectorSearcher.Search (bounded heap) over {count} x {dimensions} vectors: " +
-            $"best of {measuredRuns} runs took {heapMs:F3} ms.");
+            $"VectorSearcher.SelectTopKFromScores (bounded heap) over {count} precomputed scores: " +
+            $"best of {measuredRuns} runs took {heapMs:F4} ms.");
         _output.WriteLine(
-            $"Reference full-sort search over the same data: " +
-            $"best of {measuredRuns} runs took {fullSortMs:F3} ms.");
+            $"Full sort of the same precomputed scores: " +
+            $"best of {measuredRuns} runs took {fullSortMs:F4} ms.");
 
-        Assert.Equal(topK, hits.Count);
-        Assert.Equal(reference, hits);
-
-        // The bound is relative, not absolute. An absolute millisecond threshold cannot work
-        // on a shared CI runner: the same search measured 1.6 ms locally and 3 s on a hosted
-        // Windows agent, a 2000x spread caused by virtualisation and noisy neighbours, not by
-        // any regression. Comparing against a full sort of the same data on the same machine
-        // in the same run cancels that out — both paths pay the identical environment tax.
+        // The bound is relative, not absolute, for the same reason as before: an absolute
+        // millisecond threshold cannot work on a shared CI runner. Comparing the two selection
+        // strategies against the same fixed scores array in the same run cancels out the
+        // environment tax that made an absolute threshold unworkable, without also cancelling
+        // out (and thereby hiding, per issue #32) a genuine regression in the selection code —
+        // there is no shared dot-product cost left in this measurement to hide behind.
         //
-        // The claim under test is that the bounded heap is not slower than sorting everything,
-        // which is the entire justification for its extra complexity. Locally that ratio is
-        // about 0.65; the 1.5x ceiling tolerates measurement noise while still failing loudly
-        // if selection ever degrades into something worse than the naive approach.
+        // With the shared cost gone, local measurement clusters tightly around 0.02-0.03 (the
+        // heap does O(N log 20) work against the full sort's O(N log N), so it should win by a
+        // wide margin, not a narrow one) — 35 consecutive runs here, solo and under the full
+        // suite's default parallelism, never exceeded 0.03. A ceiling of 1.0 keeps the assertion
+        // legible as exactly the claim under test ("the heap must not be slower than sorting
+        // everything") while leaving roughly 30x headroom over the observed value for a slower or
+        // noisier CI runner — tight enough to fail loudly on a real regression, unlike the 1.5
+        // ceiling this replaces, which tolerated noise from cost this measurement no longer pays.
         double ratio = heapMs / fullSortMs;
 
-        _output.WriteLine($"Heap/full-sort ratio: {ratio:F3} (lower is better).");
+        _output.WriteLine($"Heap/full-sort selection ratio: {ratio:F3} (lower is better).");
 
         Assert.True(
-            ratio < 1.5,
-            $"Bounded-heap selection took {heapMs:F3} ms against {fullSortMs:F3} ms for a full sort " +
-            $"(ratio {ratio:F3}). The heap is meant to be no slower than sorting everything.");
+            ratio < 1.0,
+            $"Bounded-heap selection took {heapMs:F4} ms against {fullSortMs:F4} ms for a full sort " +
+            $"of the same precomputed scores (ratio {ratio:F3}). The heap is meant to be no slower " +
+            $"than sorting everything.");
     }
 
-    private static ScoredIndex[] FullSortReferenceSearch(float[] vectors, int dimensions, float[] query, int topK)
+    /// <summary>
+    /// The naive baseline <see cref="VectorSearcher.SelectTopKFromScores"/> is compared against:
+    /// sort every score, then take the first <paramref name="topK"/>. Operates on an already
+    /// -computed <paramref name="scores"/> array (row index doubles as <see
+    /// cref="ScoredIndex.Index"/>) so the comparison is selection strategy against selection
+    /// strategy, not selection strategy against selection-strategy-plus-a-second-dot-product-pass.
+    /// </summary>
+    private static ScoredIndex[] FullSortSelectTopK(float[] scores, int topK)
     {
-        int count = vectors.Length / dimensions;
+        int count = scores.Length;
         ScoredIndex[] all = new ScoredIndex[count];
         for (int i = 0; i < count; i++)
-            all[i] = new ScoredIndex(i, TensorPrimitives.Dot<float>(vectors.AsSpan(i * dimensions, dimensions), query));
+            all[i] = new ScoredIndex(i, scores[i]);
 
         Array.Sort(all, static (a, b) =>
         {
