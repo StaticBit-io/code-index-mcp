@@ -61,24 +61,13 @@ public sealed class VectorSearcher
     /// and scores identically under Reciprocal Rank Fusion to a genuinely strong match elsewhere.
     /// </param>
     /// <remarks>
-    /// Selection of the top K uses a size-bounded min-heap (<see cref="PriorityQueue{TElement,TPriority}"/>)
-    /// rather than sorting all <see cref="Count"/> scores: that is O(N log K) instead of
-    /// O(N log N). At the project's measured scale (8735 x 1024, topK 20, Release, best of
-    /// several warmed-up runs) this measured roughly 1.6 ms against roughly 2.1 ms for a full
-    /// sort — the win is real but modest (about half a millisecond here), so this is not the
-    /// dominant cost of a search; the SIMD scoring loop below, which both approaches share, is.
-    /// The heap never holds more than <paramref name="topK"/> entries, so a candidate only
-    /// survives a comparison against the current worst kept score, not against the whole
-    /// result set.
-    ///
-    /// The heap is keyed by <c>(Score, Index)</c> rather than by score alone:
-    /// <see cref="PriorityQueue{TElement,TPriority}"/> does not guarantee which of two
-    /// equal-priority entries is treated as the root, so keying by score alone let eviction
-    /// silently drop either side of a tie depending on internal heap shape — breaking the
-    /// ascending-index tie-break at the selection boundary even though the final sort still
-    /// enforced it among survivors. <see cref="WorstFirstComparer"/> defines "worse" as lower
-    /// score, and on a tied score, as the *higher* index, so eviction always drops the
-    /// higher-index element of a tie and the kept set is deterministic regardless of topK.
+    /// Scoring (<see cref="ComputeScores"/>) and selection (<see cref="SelectTopKFromScores"/>)
+    /// are two separate steps chained together here. Selection uses a size-bounded min-heap
+    /// rather than sorting every score: O(N log K) instead of O(N log N) — see
+    /// <see cref="SelectTopKFromScores"/> for why, and for the tie-break rule it enforces at the
+    /// selection boundary. In practice the SIMD scoring pass, which any selection strategy must
+    /// pay identically, dominates the cost of a search; selection over it is a comparatively
+    /// small and fast step (see <see cref="SelectTopKFromScores"/>'s own remarks for scale).
     /// </remarks>
     public IReadOnlyList<ScoredIndex> Search(ReadOnlySpan<float> query, int topK, float minScore = float.NegativeInfinity)
     {
@@ -105,21 +94,95 @@ public sealed class VectorSearcher
 
         int take = Math.Min(topK, _count);
 
-        PriorityQueue<int, (float Score, int Index)> heap = new(take, WorstFirstComparer.Instance);
+        float[] scores = ComputeScores(query);
+
+        return SelectTopKFromScores(scores, take, minScore);
+    }
+
+    /// <summary>
+    /// Scores every row against <paramref name="query"/> via cosine similarity (a plain dot
+    /// product — see the class remarks on why vectors are assumed unit-normalised) and returns
+    /// the raw, unranked scores, one per row, in row order.
+    /// </summary>
+    /// <remarks>
+    /// Split out from <see cref="Search"/> so the dot-product pass — the dominant, shared cost
+    /// of a search, identical regardless of selection strategy — can be measured or reused on
+    /// its own, separately from <see cref="SelectTopKFromScores"/>. <c>internal</c> rather than
+    /// private purely so the realistic-scale benchmark test can time the two independently
+    /// instead of only ever measuring them bundled together (see
+    /// <c>VectorSearcherTests.Search_At8735By1024RealisticScale_CompletesWithinAGenerousBound</c>
+    /// for why that bundling made the benchmark's heap-vs-full-sort ratio noisy).
+    ///
+    /// <para>
+    /// This split is not free, and the cost lands on the production path rather than the test:
+    /// the previous fused loop scored and offered each row to the heap in one pass and so never
+    /// held more than <c>topK</c> entries, whereas materialising every score first makes a
+    /// search allocate an <see cref="float"/> array of <see cref="Count"/> elements. Memory per
+    /// search goes from O(topK) to O(N). At this project's measured scale that is 8735 floats,
+    /// about 35 KB of short-lived Gen0 garbage per query, against a query that spends roughly
+    /// 190 ms waiting for Ollama to embed the text and about 1.6 ms searching — immaterial, and
+    /// measured to be so rather than assumed. It would stop being immaterial on an index one or
+    /// two orders of magnitude larger, at which point fusing the two steps back together for the
+    /// production path (keeping them separate only for the benchmark) is the fix.
+    /// </para>
+    /// </remarks>
+    internal float[] ComputeScores(ReadOnlySpan<float> query)
+    {
+        float[] scores = new float[_count];
 
         for (int i = 0; i < _count; i++)
         {
-            // Unit-normalised vectors make the dot product the cosine similarity directly.
             // TensorPrimitives.Dot runs as a single SIMD block operation over the whole row,
             // never element by element.
-            float score = TensorPrimitives.Dot(_vectors.AsSpan(i * _dimensions, _dimensions), query);
+            scores[i] = TensorPrimitives.Dot(_vectors.AsSpan(i * _dimensions, _dimensions), query);
+        }
+
+        return scores;
+    }
+
+    /// <summary>
+    /// Selects the <paramref name="take"/> highest values from <paramref name="scores"/> (row
+    /// index i.e. array position doubles as the row's <see cref="ScoredIndex.Index"/>), excluding
+    /// any value below <paramref name="minScore"/>, using a size-bounded min-heap rather than
+    /// sorting every score: that is O(N log <paramref name="take"/>) instead of O(N log N). The
+    /// heap never holds more than <paramref name="take"/> entries, so a candidate only survives a
+    /// comparison against the current worst kept score, not against the whole result set.
+    /// </summary>
+    /// <remarks>
+    /// The heap is keyed by <c>(Score, Index)</c> rather than by score alone:
+    /// <see cref="PriorityQueue{TElement,TPriority}"/> does not guarantee which of two
+    /// equal-priority entries is treated as the root, so keying by score alone let eviction
+    /// silently drop either side of a tie depending on internal heap shape — breaking the
+    /// ascending-index tie-break at the selection boundary even though the final sort still
+    /// enforced it among survivors. <see cref="WorstFirstComparer"/> defines "worse" as lower
+    /// score, and on a tied score, as the *higher* index, so eviction always drops the
+    /// higher-index element of a tie and the kept set is deterministic regardless of <paramref
+    /// name="take"/>.
+    ///
+    /// <c>internal static</c> (rather than a private instance detail of <see cref="Search"/>) for
+    /// the same reason as <see cref="ComputeScores"/>: it lets a benchmark exercise this
+    /// selection strategy in isolation, on a fixed precomputed <paramref name="scores"/> array,
+    /// instead of only ever timing it fused with the dot-product pass. Reusing this exact method
+    /// — rather than a second, test-local copy of the heap logic — matters because the
+    /// eviction tie-break above is easy to get subtly wrong (see the regression tests built from
+    /// the duplicate-symbol scenario); a hand-rolled copy in test code could drift from this
+    /// implementation and silently start comparing two different algorithms.
+    /// </remarks>
+    internal static ScoredIndex[] SelectTopKFromScores(ReadOnlySpan<float> scores, int take, float minScore)
+    {
+        PriorityQueue<int, (float Score, int Index)> heap = new(take, WorstFirstComparer.Instance);
+
+        for (int i = 0; i < scores.Length; i++)
+        {
+            float score = scores[i];
 
             if (score < minScore)
             {
                 // Below the relevance floor: excluded outright, never merely low priority. A row
                 // this weak must not fill out the result set just because fewer than `take` rows
                 // cleared the floor — an empty (or short) result honestly says "nothing here was
-                // relevant enough," which is the whole point of the floor (see the parameter doc).
+                // relevant enough," which is the whole point of the floor (see Search's parameter
+                // doc).
                 continue;
             }
 
