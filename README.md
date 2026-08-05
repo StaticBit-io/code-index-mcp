@@ -803,6 +803,23 @@ the wrapper regardless of case, spacing, or hidden Unicode tricks.
 - **Markdown can outrank the code it documents for doc-shaped queries.** See
   [Narrowing to code vs. documentation](#narrowing-to-code-vs-documentation) for what was measured
   and how to filter it out with `kind` when it matters.
+- **Code that participates in a feature only by *calling into* it is close to invisible here.**
+  Similarity is computed against a chunk's own text, so a method that takes part in a feature
+  without naming it has nothing to match on. Measured case: `wallet`'s Windows lifecycle handler
+  `OnAppWindowChanged` calls `OnAppSleep`/`OnAppResume` on minimise/restore and is therefore part
+  of the auto-lock mechanism, but its body never says "lock", "auto" or "timeout", and neither
+  does its path. Against the query *"what fires when the auto-lock timeout elapses"* it scores
+  **0.4184** — well inside the band of genuinely irrelevant results, not marginally below the
+  floor. `Grep` finds it easily, because once you know the symbol `OnAppResume` a literal search
+  reaches every caller; embedding similarity has no equivalent of that second hop.
+  This is a capability boundary, not a tuning problem — lowering the relevance floor far enough
+  to admit 0.4184 would re-admit measured off-topic matches too (see `MinCosineSimilarity`'s
+  remarks and issue #35). It is also the concrete mechanism behind the coverage gap in
+  [Cost and accuracy](#cost-and-accuracy-what-four-measurements-actually-showed): platform-guarded
+  variants, alternative implementations and parallel code paths are exactly the shapes that
+  participate without naming. **If completeness is what you need — "find every caller", "is this
+  handled on all platforms" — use `Grep`, or use `code_search` to find the symbol and `Grep` to
+  find its callers.**
 - **Chunk ids do not survive a reindex — but reusing a stale one is now detected, not silently
   wrong.** Each id (e.g. `"myproject:3:4137"`) is an ordinal position in the specific index
   snapshot of *that project* a `code_search` call ran against, plus the generation number of that

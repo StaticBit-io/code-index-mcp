@@ -123,6 +123,28 @@ public sealed class EmbeddingOptions
     /// (rank-1 cosine for genuine vs. off-topic queries against a real index) before trusting this
     /// default on a different configuration.
     /// </para>
+    /// <para>
+    /// <b>Issue #35 case study — a genuine miss is not always a threshold problem.</b> The
+    /// <c>wallet</c> corpus's Windows-only lifecycle wiring — <c>Platforms/Windows/App.xaml.cs</c>'s
+    /// <c>OnAppWindowChanged</c> method, which calls <c>OnAppSleep</c>/<c>OnAppResume</c> when the
+    /// window is minimized/restored — never surfaces for the query "what fires when the auto-lock
+    /// timeout elapses": measured directly against Ollama (bypassing this floor), that chunk's
+    /// cosine similarity for that query is <b>0.4184</b> — 0.13 below this floor, and squarely
+    /// inside the noise band above (0.3321–0.5402), not a marginal miss sitting at the boundary.
+    /// The method body never mentions "lock", "auto", or "timeout"; it only calls two
+    /// unrelated-looking methods on another type. <see cref="Chunking.RoslynChunker"/> already
+    /// prepends the file's own path as a lexical signal (<c>"File: {path}\n"</c> — see
+    /// <c>BuildEmbedText</c>), but that does not help here because the path itself
+    /// ("Platforms/Windows/App.xaml.cs") carries no lock/timeout vocabulary either. Tellingly, a
+    /// different, path-adjacent phrasing — "how does the app lock on resume" — scores <b>0.5880</b>
+    /// for the exact same chunk, comfortably above the floor: this is a phrasing-sensitive content
+    /// gap in one file's embedding, not a systemic threshold miscalibration. Lowering the floor far
+    /// enough to admit 0.4184 would also re-admit several of the genuinely off-topic queries this
+    /// constant was measured against (the noise band tops out at 0.5402), trading one known miss
+    /// for unmeasured false positives elsewhere — so the floor was left unchanged after this
+    /// investigation. See issue #35 for the full measurement and the alternatives considered (and
+    /// rejected, for lack of measurement) before reaching that conclusion.
+    /// </para>
     /// </remarks>
     public double MinCosineSimilarity { get; set; } = DefaultMinCosineSimilarity;
 
